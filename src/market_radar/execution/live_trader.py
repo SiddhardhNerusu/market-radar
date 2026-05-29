@@ -1554,7 +1554,20 @@ class LiveTrader:
         learn_mult, learn_reason = self._learning_multiplier(
             symbol, cand.get("event_type"),
         )
-        total_mult = conf_mult * regime_mult * learn_mult
+        # EARNINGS PROXIMITY MULT — pre-earnings drift is documented.
+        # Boost sizing 1.3× if ticker reports earnings within 2 days.
+        # Skip crypto (no earnings).
+        earnings_mult, earnings_reason = 1.0, ""
+        if "/" not in symbol:
+            try:
+                from ..ingestors.earnings_calendar import days_until_earnings
+                dte_to_earnings = days_until_earnings(symbol)
+                if dte_to_earnings is not None and dte_to_earnings <= 2:
+                    earnings_mult = 1.3
+                    earnings_reason = f"earnings_in_{dte_to_earnings}d"
+            except Exception:  # noqa: BLE001
+                pass
+        total_mult = conf_mult * regime_mult * learn_mult * earnings_mult
         eff_equity = self._effective_equity(account)
         adjusted_equity = eff_equity * total_mult
         # Crypto allows fractional qty, lower min_qty floor too
@@ -1571,11 +1584,13 @@ class LiveTrader:
             allow_fractional=is_crypto_sym,
             min_qty=(0.0001 if is_crypto_sym else 1.0),
         )
-        if conf_reasons or regime_mult != 1.0 or learn_mult != 1.0:
+        if conf_reasons or regime_mult != 1.0 or learn_mult != 1.0 or earnings_mult != 1.0:
             log.info(
-                "[%s] sizing mults: confluence=%.2fx (%s) regime=%.2fx learn=%.2fx (%s) → total=%.2fx",
+                "[%s] sizing mults: confluence=%.2fx (%s) regime=%.2fx learn=%.2fx (%s) "
+                "earnings=%.2fx (%s) → total=%.2fx",
                 symbol, conf_mult, ",".join(conf_reasons) or "none",
-                regime_mult, learn_mult, learn_reason or "neutral", total_mult,
+                regime_mult, learn_mult, learn_reason or "neutral",
+                earnings_mult, earnings_reason or "none", total_mult,
             )
         if not sized.tradeable:
             self._persist_decision(

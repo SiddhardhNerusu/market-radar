@@ -62,6 +62,7 @@ DEFAULTS = {
     "rss_news_seconds":    3 * 60,
     "reddit_seconds":      3 * 60,
     "stocktwits_seconds":  2 * 60,
+    "earnings_calendar_seconds": 12 * 60 * 60,  # twice a day — Finnhub free tier
     "t212_snap_seconds":   5 * 60,
     "scoring_seconds":     30,
     "outcome_snap_seconds": 60,
@@ -112,6 +113,11 @@ def _job_reddit() -> None:
 
 def _job_stocktwits() -> None:
     StockTwitsTrendingIngestor().poll()
+
+def _job_earnings_calendar() -> None:
+    """Pull next 30 days of US earnings from Finnhub. Runs twice daily."""
+    from .ingestors.earnings_calendar import EarningsCalendarIngestor
+    EarningsCalendarIngestor().poll()
 
 def _job_t212_snap() -> None:
     if not CONFIG.has_t212:
@@ -224,6 +230,7 @@ def build_scheduler() -> BackgroundScheduler:
         ("rss_news",       _job_rss_news,       DEFAULTS["rss_news_seconds"]),
         ("reddit",         _job_reddit,         DEFAULTS["reddit_seconds"]),
         ("stocktwits",     _job_stocktwits,     DEFAULTS["stocktwits_seconds"]),
+        ("earnings_cal",   _job_earnings_calendar, DEFAULTS["earnings_calendar_seconds"]),
         ("t212_snapshot",  _job_t212_snap,      DEFAULTS["t212_snap_seconds"]),
         ("score",          _job_score,          DEFAULTS["scoring_seconds"]),
         ("outcome_snap",   _job_outcome_snap,   DEFAULTS["outcome_snap_seconds"]),

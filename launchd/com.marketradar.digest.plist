@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.marketradar.digest</string>
+  <key>ProgramArguments</key><array>
+    <string>__HOME__/Documents/Claude/Projects/MARKET RADAR/.venv/bin/python</string>
+    <string>__HOME__/Documents/Claude/Projects/MARKET RADAR/scripts/weekly_digest.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__HOME__/Documents/Claude/Projects/MARKET RADAR</string>
+  <!-- Sunday 22:00 BST = Sunday 21:00 UTC.
+       Weekday=0 in launchd's StartCalendarInterval = Sunday.
+       Fires once per week — captures the full Mon-Fri trading week
+       plus Sat-Sun crypto. -->
+  <key>StartCalendarInterval</key><dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>21</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/MarketRadar/digest.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/MarketRadar/digest.err</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>

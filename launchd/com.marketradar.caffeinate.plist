@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Keep this Mac awake 24/7 so the bot never pauses overnight.
+       Flags:
+         -d  prevent display sleep (overkill but harmless on battery)
+         -i  prevent idle sleep
+         -m  prevent disk-spin-down sleep
+         -s  prevent system sleep (only valid on AC power)
+       Combined: machine NEVER sleeps while this job is alive. -->
+  <key>Label</key><string>com.marketradar.caffeinate</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-d</string>
+    <string>-i</string>
+    <string>-m</string>
+    <string>-s</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/Library/Logs/MarketRadar/caffeinate.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/MarketRadar/caffeinate.err</string>
+</dict>
+</plist>

@@ -313,16 +313,24 @@ def notify_trade(alert: TradeAlert) -> bool:
 
 
 def _format_trade(a: TradeAlert) -> str:
+    """Telegram format. FILL notifications LEAD with symbol + P/L so the
+    user sees "AMZN +$100" at a glance — the user-requested format."""
+    # Profit/loss-aware emojis — win vs loss visually distinct.
+    is_profit = a.pnl_usd > 0
+    is_loss = a.pnl_usd < 0
     emojis = {
         "PLACED":       "🟢" if a.direction == "buy" else "🔴",
         "OPTIONS_PLACED": "💎",
+        "OPTIONS_SUBMITTED": "📨",
+        "OPTIONS_OPENED": "💎",
         "RISK_BLOCKED": "🛑",
-        "FILLED":       "✅",
+        "FILLED":       "✅" if is_profit else ("❌" if is_loss else "⚪"),
+        "OPTIONS_FILLED": "✅" if is_profit else ("❌" if is_loss else "💎"),
         "PNL_DAY":      "📊" if a.pnl_usd >= 0 else "📉",
         "REGIME_HALT":  "⚠️",
     }
     emoji = emojis.get(a.kind, "•")
-    if a.kind in ("PLACED", "OPTIONS_PLACED"):
+    if a.kind in ("PLACED", "OPTIONS_PLACED", "OPTIONS_SUBMITTED"):
         return (
             f"{emoji} <b>{a.kind} {a.direction.upper()} {a.symbol}</b>\n"
             f"qty: {a.qty:g}  @ ${a.price:.2f}\n"
@@ -330,23 +338,41 @@ def _format_trade(a: TradeAlert) -> str:
             f"notional: ${a.notional_usd:,.0f}\n"
             f"{a.extra}"
         ).strip()
+    if a.kind == "OPTIONS_OPENED":
+        # Entry confirmation for option spreads — no P/L yet.
+        return (
+            f"{emoji} <b>{a.symbol.upper()} OPEN {a.direction.upper()}</b>\n"
+            f"{a.qty:g} contracts · {a.extra}"
+        ).strip()
     if a.kind == "RISK_BLOCKED":
         return (
             f"{emoji} <b>RISK BLOCKED {a.symbol}</b>\n"
             f"{a.direction.upper()} blocked by risk manager\n"
             f"{a.extra}"
         ).strip()
-    if a.kind == "FILLED":
+    if a.kind in ("FILLED", "OPTIONS_FILLED"):
         sign = "+" if a.pnl_usd >= 0 else ""
-        return (
-            f"{emoji} <b>FILLED {a.symbol}</b>\n"
-            f"P&L: {sign}${a.pnl_usd:.2f}\n"
-            f"{a.extra}"
-        ).strip()
+        # P/L is the headline. Extra context goes below.
+        # Format: "✅ AMZN  +$100.00" or "❌ TSLA  -$45.00"
+        # Inline: "OPTIONS_FILLED" → "AMZN spread" to make it clear
+        label = "spread" if a.kind == "OPTIONS_FILLED" else ""
+        line1 = (
+            f"{emoji} <b>{a.symbol.upper()} {label} "
+            f"{sign}${a.pnl_usd:,.2f}</b>"
+        ).replace("  ", " ").strip()
+        details: list[str] = []
+        if a.notional_usd:
+            details.append(f"size ${a.notional_usd:,.0f}")
+        if a.qty and a.qty > 0:
+            details.append(f"qty {a.qty:g}")
+        if a.extra:
+            details.append(a.extra)
+        line2 = " · ".join(details) if details else ""
+        return (line1 + ("\n" + line2 if line2 else "")).strip()
     if a.kind == "PNL_DAY":
         sign = "+" if a.pnl_usd >= 0 else ""
         return (
-            f"{emoji} <b>Daily P&L: {sign}${a.pnl_usd:.2f}</b>\n"
+            f"{emoji} <b>Daily P&L: {sign}${a.pnl_usd:,.2f}</b>\n"
             f"{a.extra}"
         ).strip()
     if a.kind == "REGIME_HALT":

@@ -354,14 +354,17 @@ class LiveTrader:
                             )
                             try:
                                 from ..notifications.realtime import TradeAlert, notify_trade
+                                # OPTIONS_OPENED — entry confirmation,
+                                # no P/L yet. The OPTIONS_FILLED kind is
+                                # reserved for spread EXITS with realized P/L.
                                 notify_trade(TradeAlert(
-                                    kind="OPTIONS_FILLED",
+                                    kind="OPTIONS_OPENED",
                                     symbol=sp["underlying"],
                                     direction=sp["direction"],
                                     qty=sp["contracts"],
                                     notional_usd=sp["total_debit_usd"],
                                     extra=(
-                                        f"FILLED — debit ${sp['total_debit_usd']:.0f} "
+                                        f"spread filled · debit ${sp['total_debit_usd']:.0f} · "
                                         f"max_gain ${sp['max_gain_usd']:.0f}"
                                     ),
                                 ))
@@ -859,20 +862,12 @@ class LiveTrader:
                         and (row["status"] or "").lower() != "new")
                 )
                 if not is_closing:
-                    try:
-                        from ..notifications.realtime import TradeAlert, notify_trade
-                        notify_trade(TradeAlert(
-                            kind="FILLED",
-                            symbol=row["ticker"],
-                            direction=row["direction"],
-                            qty=float(fresh.filled_qty or 0),
-                            price=float(fresh.filled_avg_price),
-                            notional_usd=(float(fresh.filled_qty or 0)
-                                          * float(fresh.filled_avg_price)),
-                            extra="entry fill confirmed",
-                        ))
-                    except Exception:  # noqa: BLE001
-                        log.debug("FILLED notification failed")
+                    # ENTRY fill confirmation — no P/L yet. Skip the
+                    # notification: bot's PA/options PLACED messages
+                    # already announce intent. We send Telegram ONLY on
+                    # exits (where P/L is known) so the user's phone
+                    # isn't double-pinged for the same trade.
+                    pass
 
     def _maybe_realize_pnl(self, conn, row, fresh) -> None:
         """If this filled order is a closing child leg, attribute P&L to its parent.
@@ -946,12 +941,15 @@ class LiveTrader:
             parent["direction"], row["ticker"], qty, entry, exit_, pnl, pct * 100,
             exit_reason,
         )
-        # Telegram on every fill (silent fail)
+        # Telegram on every exit fill (silent fail)
         try:
             from ..notifications.realtime import TradeAlert, notify_trade
             notify_trade(TradeAlert(
                 kind="FILLED", symbol=row["ticker"], pnl_usd=pnl,
-                extra=f"{parent['direction']} {qty:.0f} @{entry:.2f}→{exit_:.2f} ({exit_reason})",
+                notional_usd=float(abs(qty) * entry),
+                qty=float(abs(qty)),
+                direction=parent["direction"],
+                extra=f"{exit_reason} · ${entry:.2f}→${exit_:.2f} ({pct*100:+.1f}%)",
             ))
         except Exception:  # noqa: BLE001
             pass
@@ -2044,7 +2042,10 @@ class LiveTrader:
                     from ..notifications.realtime import TradeAlert, notify_trade
                     notify_trade(TradeAlert(
                         kind="FILLED", symbol=pair, pnl_usd=pnl,
-                        extra=f"CRYPTO {exit_reason}: entry=${entry:.4f}→${current_price:.4f}",
+                        notional_usd=float(qty * entry),
+                        qty=float(qty),
+                        extra=(f"crypto {exit_reason} · "
+                               f"${entry:.4f}→${current_price:.4f}"),
                     ))
                 except Exception:  # noqa: BLE001
                     pass
@@ -2329,10 +2330,13 @@ class LiveTrader:
                 try:
                     from ..notifications.realtime import TradeAlert, notify_trade
                     notify_trade(TradeAlert(
-                        kind="FILLED", symbol=sp["underlying"],
+                        kind="OPTIONS_FILLED", symbol=sp["underlying"],
                         pnl_usd=realized,
-                        extra=f"OPTIONS {exit_reason}: {sp['strategy']} "
-                              f"entry=${entry_debit:.2f}→${current_debit:.2f} ({pnl_pct_of_debit*100:+.1f}%)",
+                        notional_usd=float(entry_debit * contracts * 100),
+                        qty=contracts,
+                        extra=(f"{exit_reason} · "
+                               f"${entry_debit:.2f}→${current_debit:.2f} "
+                               f"({pnl_pct_of_debit*100:+.1f}%)"),
                     ))
                 except Exception:  # noqa: BLE001
                     pass
@@ -2619,6 +2623,17 @@ class LiveTrader:
                 total_pnl += pnl
                 closed_count += 1
                 log.info("  EOD closed %s qty=%.2f u_pnl=$%.2f", sym, p.qty, pnl)
+                # Per-position EOD close notification with P/L.
+                try:
+                    from ..notifications.realtime import TradeAlert, notify_trade
+                    notify_trade(TradeAlert(
+                        kind="FILLED", symbol=sym, pnl_usd=pnl,
+                        notional_usd=abs(float(p.market_value)),
+                        qty=abs(float(p.qty)),
+                        extra="eod_flatten",
+                    ))
+                except Exception:  # noqa: BLE001
+                    pass
                 # Record realized P&L into bot_orders (matched by ticker)
                 # + book to daily P&L. Idempotent — won't double-count because
                 # the reconcile loop only fills realized_pnl_usd once.

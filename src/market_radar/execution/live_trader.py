@@ -944,12 +944,17 @@ class LiveTrader:
         # Telegram on every exit fill (silent fail)
         try:
             from ..notifications.realtime import TradeAlert, notify_trade
+            headline = self._headline_for_order(
+                alpaca_order_id=parent.get("alpaca_order_id"))
+            extra = f"{exit_reason} · ${entry:.2f}→${exit_:.2f} ({pct*100:+.1f}%)"
+            if headline:
+                extra = f"{extra}\n💬 {headline}"
             notify_trade(TradeAlert(
                 kind="FILLED", symbol=row["ticker"], pnl_usd=pnl,
                 notional_usd=float(abs(qty) * entry),
                 qty=float(abs(qty)),
                 direction=parent["direction"],
-                extra=f"{exit_reason} · ${entry:.2f}→${exit_:.2f} ({pct*100:+.1f}%)",
+                extra=extra,
             ))
         except Exception:  # noqa: BLE001
             pass
@@ -2040,12 +2045,30 @@ class LiveTrader:
                     self._update_daily_pnl(conn, pnl)
                 try:
                     from ..notifications.realtime import TradeAlert, notify_trade
+                    headline = None
+                    try:
+                        # tp_sl has decision context with score_id we can use
+                        with get_connection() as _hc:
+                            _row = _hc.execute(
+                                """SELECT rs.title FROM signal_scores ss
+                                   JOIN raw_signals rs ON rs.id = ss.signal_id
+                                   WHERE ss.id = ? LIMIT 1""",
+                                (tp_sl.get("score_id"),),
+                            ).fetchone()
+                            if _row and _row[0]:
+                                t = str(_row[0]).strip()
+                                headline = t[:80] + ("…" if len(t) > 80 else "")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    extra = (f"crypto {exit_reason} · "
+                             f"${entry:.4f}→${current_price:.4f}")
+                    if headline:
+                        extra = f"{extra}\n💬 {headline}"
                     notify_trade(TradeAlert(
                         kind="FILLED", symbol=pair, pnl_usd=pnl,
                         notional_usd=float(qty * entry),
                         qty=float(qty),
-                        extra=(f"crypto {exit_reason} · "
-                               f"${entry:.4f}→${current_price:.4f}"),
+                        extra=extra,
                     ))
                 except Exception:  # noqa: BLE001
                     pass
@@ -2329,14 +2352,18 @@ class LiveTrader:
 
                 try:
                     from ..notifications.realtime import TradeAlert, notify_trade
+                    headline = self._headline_for_order(spread_id=sp["id"])
+                    extra = (f"{exit_reason} · "
+                             f"${entry_debit:.2f}→${current_debit:.2f} "
+                             f"({pnl_pct_of_debit*100:+.1f}%)")
+                    if headline:
+                        extra = f"{extra}\n💬 {headline}"
                     notify_trade(TradeAlert(
                         kind="OPTIONS_FILLED", symbol=sp["underlying"],
                         pnl_usd=realized,
                         notional_usd=float(entry_debit * contracts * 100),
                         qty=contracts,
-                        extra=(f"{exit_reason} · "
-                               f"${entry_debit:.2f}→${current_debit:.2f} "
-                               f"({pnl_pct_of_debit*100:+.1f}%)"),
+                        extra=extra,
                     ))
                 except Exception:  # noqa: BLE001
                     pass
@@ -2746,6 +2773,52 @@ class LiveTrader:
                                 sp_d["underlying"], exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("_eod_flatten_day_trader_options error: %s", exc)
+
+    def _headline_for_order(self, alpaca_order_id: Optional[str] = None,
+                             spread_id: Optional[int] = None) -> Optional[str]:
+        """Look up the originating signal title for a trade so fill
+        notifications can show WHY the bot opened the position.
+
+        Pass either ``alpaca_order_id`` (for stock/crypto bracket orders)
+        or ``spread_id`` (for option spread closes). Returns the news
+        headline (truncated to 80 chars) or None.
+        """
+        try:
+            with get_connection() as conn:
+                if alpaca_order_id:
+                    row = conn.execute(
+                        """
+                        SELECT rs.title
+                        FROM bot_orders bo
+                        JOIN bot_decisions bd ON bd.alpaca_order_id = bo.alpaca_order_id
+                        JOIN signal_scores ss ON ss.id = bd.score_id
+                        JOIN raw_signals rs ON rs.id = ss.signal_id
+                        WHERE bo.alpaca_order_id = ? OR bd.alpaca_order_id = ?
+                        LIMIT 1
+                        """,
+                        (alpaca_order_id, alpaca_order_id),
+                    ).fetchone()
+                elif spread_id is not None:
+                    row = conn.execute(
+                        """
+                        SELECT rs.title
+                        FROM bot_option_spreads sp
+                        JOIN bot_option_decisions od ON od.id = sp.decision_id
+                        JOIN signal_scores ss ON ss.id = od.score_id
+                        JOIN raw_signals rs ON rs.id = ss.signal_id
+                        WHERE sp.id = ?
+                        LIMIT 1
+                        """,
+                        (spread_id,),
+                    ).fetchone()
+                else:
+                    return None
+            if not row or not row[0]:
+                return None
+            t = str(row[0]).strip()
+            return t[:80] + ("…" if len(t) > 80 else "")
+        except Exception:  # noqa: BLE001
+            return None
 
     def _learning_multiplier(self, ticker: str,
                               event_type: Optional[str]) -> tuple[float, str]:

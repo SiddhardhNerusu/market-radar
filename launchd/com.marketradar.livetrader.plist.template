@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+MARKET RADAR — Live Trader launchd plist
+============================================
+Registers the auto-trader as a per-user LaunchAgent. Auto-starts at login,
+auto-restarts on crash. Logs to ~/Library/Logs/MarketRadar/livetrader.*.log.
+
+Installed via scripts/install_livetrader_launchd.sh which substitutes the
+__PYTHON__, __PROJECT_ROOT__, __HOME__ placeholders.
+
+To enable OPTIONS mode, set LIVE_OPTIONS_ENABLED=1 in your .env file.
+To set the £5k paper-account override, set LIVE_OVERRIDE_EQUITY_USD=6300.
+Both vars get loaded by config.py via dotenv when the trader starts.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.marketradar.livetrader</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__PROJECT_ROOT__/scripts/run_live_trader.py</string>
+        <string>--paper</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <!-- £5k account configuration -->
+        <key>LIVE_OVERRIDE_EQUITY_USD</key>
+        <string>6300</string>
+        <key>RISK_MAX_GROSS_EXPOSURE_USD</key>
+        <string>6000</string>
+        <key>RISK_DAILY_LOSS_CAP_USD</key>
+        <string>250</string>
+        <key>LIVE_OPTIONS_ENABLED</key>
+        <string>1</string>
+        <key>LIVE_INTERVAL_SECONDS</key>
+        <string>45</string>
+        <!-- Paper trading: disable PDT (paper has no enforcement). When you go
+             LIVE on real money <$25k, set this to 1 to re-enable. -->
+        <key>LIVE_PDT_ENFORCE</key>
+        <string>0</string>
+        <!-- Process more candidates per loop so crypto + options + stocks all get a chance -->
+        <key>LIVE_MAX_CANDIDATES_PER_LOOP</key>
+        <string>25</string>
+        <!-- Paper: allow many more trades per day for visibility / validation.
+             When LIVE, lower this back to 10-20 to control variance. -->
+        <key>RISK_MAX_DAILY_TRADES</key>
+        <string>50</string>
+        <!-- Lower min calibrated p slightly for price-action signals to pass -->
+        <key>RISK_MIN_CALIBRATED_P</key>
+        <string>0.55</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- 60s between restart attempts to avoid crash-looping -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/MarketRadar/livetrader.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/MarketRadar/livetrader.err.log</string>
+
+    <key>Nice</key>
+    <integer>5</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>

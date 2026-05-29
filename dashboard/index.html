@@ -1,0 +1,699 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MARKET RADAR — Picks</title>
+<meta name="color-scheme" content="dark">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+    color-scheme: dark;
+    --bg: #0b0d12;
+    --panel: #141822;
+    --panel-2: #1a1f2b;
+    --border: #243047;
+    --fg: #e8edf2;
+    --muted: #8a93a6;
+    --accent-buy: #7ad0ff;
+    --accent-sell: #ff7a7a;
+    --green-strong: #1f7a3a;
+    --green-mid:    #2aa056;
+    --green-soft:   #2f4a3d;
+    --red-strong:   #8a1f1f;
+    --red-mid:      #c63838;
+    --red-soft:     #4a2f33;
+    --watch-buy-bg: #1e2c4a;
+    --watch-sell-bg: #3a2a2f;
+    --warn: #f5a623;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px; line-height: 1.45; }
+a { color: var(--accent-buy); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.wrap { padding: 16px 18px; max-width: 1500px; margin: 0 auto; }
+
+/* Tabs */
+.tabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+.tab { padding: 8px 14px; cursor: pointer; color: var(--muted);
+    border-bottom: 2px solid transparent; font-weight: 600; font-size: 13px; }
+.tab.active { color: var(--accent-buy); border-bottom-color: var(--accent-buy); }
+.tab a { color: inherit; text-decoration: none; display: block; }
+.tab a:hover { color: var(--accent-buy); }
+
+/* Status strip */
+.status-strip {
+    display: flex; align-items: center; gap: 16px;
+    padding: 10px 14px; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 14px; flex-wrap: wrap; font-size: 12px;
+}
+.status-strip .item { display: flex; align-items: center; gap: 6px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.dot.ok { background: var(--green-mid); }
+.dot.bad { background: var(--red-mid); }
+.dot.warn { background: var(--warn); }
+.status-strip button {
+    background: var(--panel-2); border: 1px solid var(--border);
+    color: var(--fg); padding: 4px 12px; border-radius: 6px;
+    cursor: pointer; font-size: 12px;
+}
+.status-strip button:hover { border-color: var(--accent-buy); color: var(--accent-buy); }
+.cfd-warn {
+    background: rgba(245,166,35,0.12); border: 1px solid var(--warn);
+    color: var(--warn); padding: 4px 10px; border-radius: 6px; font-weight: 600;
+}
+
+/* Two columns */
+.columns { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+@media (max-width: 900px) { .columns { grid-template-columns: 1fr; } }
+
+.column { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden; }
+.column-head {
+    padding: 12px 14px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--panel-2);
+}
+.column-head h2 {
+    margin: 0; font-size: 14px; font-weight: 700;
+    letter-spacing: 0.04em; text-transform: uppercase;
+}
+.column.buy .column-head h2 { color: var(--accent-buy); }
+.column.sell .column-head h2 { color: var(--accent-sell); }
+
+.column-head .summary { font-size: 11px; color: var(--muted); }
+
+.cards { display: flex; flex-direction: column; }
+.empty { padding: 22px 18px; color: var(--muted); font-size: 13px; font-style: italic; }
+
+/* Pick card */
+.card {
+    border-bottom: 1px solid var(--border);
+    padding: 12px 14px;
+    cursor: pointer;
+    transition: background 0.06s;
+}
+.card:hover { background: var(--panel-2); }
+.card:last-child { border-bottom: 0; }
+.card-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ticker { font-size: 18px; font-weight: 700; min-width: 70px; }
+.action {
+    display: inline-block; padding: 3px 9px; border-radius: 4px;
+    font-size: 10px; font-weight: 800; letter-spacing: 0.07em;
+    text-transform: uppercase; min-width: 86px; text-align: center;
+}
+.action.STRONG_BUY  { background: var(--green-strong); color: white; }
+.action.BUY         { background: var(--green-mid);    color: white; }
+.action.WATCH_BUY   { background: var(--watch-buy-bg); color: var(--accent-buy); border: 1px solid var(--accent-buy); }
+.action.HOLD        { background: #2a2f3c; color: var(--muted); }
+.action.WATCH_SELL  { background: var(--watch-sell-bg); color: var(--accent-sell); border: 1px solid var(--accent-sell); }
+.action.SELL        { background: var(--red-mid);      color: white; }
+.action.STRONG_SELL { background: var(--red-strong);   color: white; }
+
+.prob {
+    font-size: 16px; font-weight: 700;
+    margin-left: auto; font-variant-numeric: tabular-nums;
+}
+.card.buy-card .prob { color: var(--accent-buy); }
+.card.sell-card .prob { color: var(--accent-sell); }
+
+.card-sub {
+    margin-top: 6px; font-size: 11.5px; color: var(--muted);
+    display: flex; gap: 10px; flex-wrap: wrap;
+}
+.card-sub .event { color: var(--fg); font-weight: 600; }
+.card-title {
+    margin-top: 4px; font-size: 12px; color: var(--fg);
+    overflow: hidden; text-overflow: ellipsis;
+    display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical;
+}
+
+.card-bottom {
+    margin-top: 6px; display: flex; align-items: center;
+    gap: 12px; font-size: 11px; color: var(--muted);
+}
+.bar {
+    height: 4px; background: #2a3346; border-radius: 2px;
+    overflow: hidden; flex: 1; max-width: 140px;
+}
+.bar-fill { height: 100%; background: var(--accent-buy); }
+.card.sell-card .bar-fill { background: var(--accent-sell); }
+
+.composite { font-variant-numeric: tabular-nums; }
+
+/* Drill-down */
+.detail {
+    background: var(--panel-2);
+    border-top: 1px solid var(--border);
+    padding: 14px 16px;
+    font-size: 12.5px;
+    display: none;
+}
+.detail.open { display: block; }
+.detail h4 {
+    margin: 12px 0 6px 0; font-size: 11px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 700;
+}
+.detail h4:first-child { margin-top: 0; }
+.detail .src-title { font-weight: 700; font-size: 13px; }
+.detail .pill {
+    display: inline-block; padding: 2px 7px; margin-right: 4px;
+    background: #2a3346; border-radius: 3px; font-size: 11px;
+}
+.detail table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.detail table td, .detail table th {
+    padding: 4px 6px; border-bottom: 1px solid var(--border); text-align: left;
+}
+.detail table th { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.detail .feature-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+.detail .feature-row .fname { min-width: 200px; font-size: 11px; }
+.detail .feature-row .fbar {
+    height: 8px; background: #2a3346; flex: 1; max-width: 250px;
+    border-radius: 2px; overflow: hidden;
+}
+.detail .feature-row .fbar-fill { background: var(--accent-buy); height: 100%; }
+.detail .feature-row .fvalue {
+    font-size: 11px; font-variant-numeric: tabular-nums; min-width: 60px;
+}
+.detail ul { padding-left: 18px; margin: 4px 0; }
+.detail .news-row { margin: 4px 0; font-size: 12px; }
+.detail .muted { color: var(--muted); }
+
+.error {
+    color: var(--accent-sell); padding: 10px 12px;
+    background: rgba(255,122,122,0.08); border: 1px solid var(--accent-sell);
+    border-radius: 6px; margin: 10px 0; font-family: monospace; font-size: 11px;
+}
+.spacer { height: 12px; }
+.calibration-note {
+    background: rgba(245,166,35,0.06); border: 1px solid rgba(245,166,35,0.3);
+    color: #d2c08c; padding: 10px 12px; border-radius: 6px;
+    font-size: 12px; margin-bottom: 14px;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+        <div>
+            <h1 style="margin:0;font-size:20px;color:var(--accent-buy)">MARKET RADAR</h1>
+            <div class="muted" style="font-size:11px">Action-first picks · model-driven · paper trade until verified</div>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <div class="tab active">Picks</div>
+        <div class="tab"><a href="/graph">Graph view</a></div>
+        <div class="tab"><a href="#" id="oldTabLink">Edge stats</a></div>
+    </div>
+
+    <div class="status-strip">
+        <div class="item"><span class="dot" id="daemonDot"></span>
+            <span id="daemonStatus">checking daemon…</span></div>
+        <div class="item">Last refresh: <strong id="lastRefresh">—</strong></div>
+        <div class="item" id="cfdStatus" style="display:none"></div>
+        <div style="margin-left:auto">
+            <button id="refreshBtn">↻ Refresh now</button>
+        </div>
+    </div>
+
+    <div id="calibrationNote" class="calibration-note" style="display:none"></div>
+
+    <!-- Live feed (auto-refresh every 5s) -->
+    <div class="column" id="liveFeedColumn" style="margin-bottom:14px">
+        <div class="column-head">
+            <h2 style="color:var(--fg)">⚡ Live feed
+                <span class="muted" style="font-weight:400;font-size:11px;margin-left:8px">
+                    auto-refresh every 5s
+                </span>
+            </h2>
+            <div class="summary" id="feedSummary">loading…</div>
+        </div>
+        <div id="feedTable">
+            <div class="empty">loading live feed…</div>
+        </div>
+        <div id="latencyFooter"
+             style="padding:8px 14px;border-top:1px solid var(--border);
+                    background:var(--panel-2);font-size:11px;color:var(--muted)">
+            latency stats loading…
+        </div>
+    </div>
+
+    <div class="columns">
+        <div class="column buy" id="buyCol">
+            <div class="column-head">
+                <h2>▲ BUY — Long candidates</h2>
+                <div class="summary" id="buySummary">loading…</div>
+            </div>
+            <div class="cards" id="buyCards"><div class="empty">loading…</div></div>
+        </div>
+        <div class="column sell" id="sellCol">
+            <div class="column-head">
+                <h2>▼ SELL — Short candidates</h2>
+                <div class="summary" id="sellSummary">loading…</div>
+            </div>
+            <div class="cards" id="sellCards"><div class="empty">loading…</div></div>
+        </div>
+    </div>
+
+    <div class="spacer"></div>
+    <div style="text-align:center;font-size:11px;color:var(--muted)">
+        BUY thresholds: WATCH 0.60 · BUY 0.67 · STRONG 0.75 ·
+        SELL thresholds: WATCH 0.40 · SELL 0.33 · STRONG 0.25 ·
+        Auto-refresh every 60s.
+    </div>
+</div>
+
+<script>
+// =========================================================
+// Config
+// =========================================================
+const REFRESH_MS = 60000;
+const PICK_LIMIT = 12;
+const HOURS_WINDOW = 48;
+
+// =========================================================
+// Utilities
+// =========================================================
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+}
+function pctFmt(p) {
+    if (p == null || isNaN(p)) return '—';
+    return (p * 100).toFixed(1) + '%';
+}
+function num(v, digits=2) {
+    if (v == null || isNaN(v)) return '—';
+    return Number(v).toFixed(digits);
+}
+function timeAgo(iso) {
+    if (!iso) return '—';
+    const t = new Date(iso).getTime();
+    if (isNaN(t)) return '—';
+    const diff = Math.floor((Date.now() - t) / 1000);
+    if (diff < 60) return diff + 's ago';
+    if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+    return Math.floor(diff/86400) + 'd ago';
+}
+
+async function fetchJson(url) {
+    try {
+        const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+        const txt = await r.text();
+        try { return JSON.parse(txt); }
+        catch (e) {
+            return { error: `HTTP ${r.status}: ${txt.slice(0,200)}` };
+        }
+    } catch (e) {
+        return { error: 'Could not reach dashboard server: ' + String(e) };
+    }
+}
+
+// =========================================================
+// Render: status strip
+// =========================================================
+async function loadStatusStrip() {
+    const h = await fetchJson('/health');
+    const dot = document.getElementById('daemonDot');
+    const txt = document.getElementById('daemonStatus');
+    if (h.ok) {
+        dot.className = 'dot ok';
+        txt.textContent = 'dashboard up';
+    } else {
+        dot.className = 'dot bad';
+        txt.textContent = 'server unreachable';
+    }
+    document.getElementById('lastRefresh').textContent =
+        new Date().toLocaleTimeString();
+}
+
+// =========================================================
+// Render: pick cards
+// =========================================================
+function renderCard(p, direction) {
+    const action = p.action || 'HOLD';
+    const compositeBar = Math.min(100, Math.round((p.composite_score || 0) * 10));
+    const agreementPct = (p.multi_model_agreement != null)
+        ? Math.round(p.multi_model_agreement * 100) : null;
+    const agreeText = agreementPct != null
+        ? `Models agree ${agreementPct}%` : 'Agreement —';
+    const dirClass = direction === 'buy' ? 'buy-card' : 'sell-card';
+    const event = esc(p.event_type || '—');
+    const src = esc(p.source || '—');
+    const ago = timeAgo(p.scored_at || p.published_at);
+    const titleHtml = esc((p.title || '').slice(0, 140));
+    return `
+      <div class="card ${dirClass}" data-signal="${p.signal_id}" data-direction="${direction}">
+        <div class="card-top">
+          <span class="ticker">$${esc(p.ticker)}</span>
+          <span class="action ${action}">${esc(action.replace('_',' '))}</span>
+          <span class="prob">${pctFmt(p.p)}</span>
+        </div>
+        <div class="card-title">${titleHtml}</div>
+        <div class="card-sub">
+          <span class="event">${event}</span>
+          <span>${src}</span>
+          <span>${ago}</span>
+        </div>
+        <div class="card-bottom">
+          <span class="composite" title="composite_score">comp ${num(p.composite_score, 1)}</span>
+          <span class="bar" title="${agreeText}">
+            <span class="bar-fill" style="width:${agreementPct != null ? agreementPct : 0}%"></span>
+          </span>
+          <span>${agreeText}</span>
+        </div>
+        <div class="detail" id="detail-${p.signal_id}"></div>
+      </div>`;
+}
+
+function renderColumn(containerId, summaryId, picks, direction) {
+    const c = document.getElementById(containerId);
+    const s = document.getElementById(summaryId);
+    if (!picks || picks.length === 0) {
+        const message = direction === 'buy'
+            ? `<div class="empty">No live signals currently meet the 0.60 BUY threshold.
+               The deployed model is conservative on the long side — its
+               max recent prediction was &lt;0.60 in the last 48h.
+               Owner: consider re-training calibration or lowering the
+               WATCH threshold.</div>`
+            : `<div class="empty">No live signals currently meet the 0.40 SELL threshold.
+               This is unusual — check daemon predict loop.</div>`;
+        c.innerHTML = message;
+        s.textContent = '0 picks';
+        return;
+    }
+    c.innerHTML = picks.map(p => renderCard(p, direction)).join('');
+    const strong = picks.filter(x => x.action && x.action.startsWith('STRONG')).length;
+    s.textContent = `${picks.length} picks · ${strong} strong`;
+    // wire up clicks
+    c.querySelectorAll('.card').forEach(el => {
+        el.addEventListener('click', () => onCardClick(el));
+    });
+}
+
+// =========================================================
+// Detail drill-down
+// =========================================================
+async function onCardClick(cardEl) {
+    const sid = cardEl.dataset.signal;
+    const detail = document.getElementById('detail-' + sid);
+    if (detail.classList.contains('open')) {
+        detail.classList.remove('open');
+        return;
+    }
+    // close any other open detail
+    document.querySelectorAll('.detail.open').forEach(el => el.classList.remove('open'));
+    detail.classList.add('open');
+    detail.innerHTML = '<div class="muted">loading why…</div>';
+    const d = await fetchJson('/api/picks/why/' + encodeURIComponent(sid));
+    if (d.error) {
+        detail.innerHTML = `<div class="error">${esc(d.error)}</div>`;
+        return;
+    }
+    detail.innerHTML = renderDetail(d);
+}
+
+function renderDetail(d) {
+    const src = d.source || {};
+    const sig = d.signal || {};
+    const mods = d.all_models || {};
+    const cmp = d.comparable_setups || {};
+
+    const sourceBlock = `
+      <h4>Source</h4>
+      <div class="src-title">${esc(src.title || '(no title)')}</div>
+      <div class="muted" style="margin-top:3px;font-size:11px">
+        ${esc(src.source_name || '—')} · tier ${esc(src.source_tier || '?')} ·
+        ${esc(src.published_at || '')}
+        ${src.url ? `· <a href="${esc(src.url)}" target="_blank" rel="noopener">open ↗</a>` : ''}
+      </div>`;
+
+    const shap = (d.shap_top10 || []);
+    const shapMax = shap.length ? Math.max(...shap.map(x => x.mean_abs_shap)) : 1;
+    const shapBlock = shap.length ? `
+      <h4>Why the model cares (top 10 features, mean |SHAP| across all signals)</h4>
+      ${shap.map(f => {
+        const pct = Math.max(2, Math.round(f.mean_abs_shap / shapMax * 100));
+        return `<div class="feature-row">
+            <span class="fname">${esc(f.feature)}</span>
+            <span class="fbar"><span class="fbar-fill" style="width:${pct}%"></span></span>
+            <span class="fvalue">${num(f.mean_abs_shap, 4)}</span>
+          </div>`;
+      }).join('')}` : '';
+
+    const newsBlock = (d.recent_news || []).length ? `
+      <h4>Recent news (last 7 days, same ticker)</h4>
+      ${d.recent_news.map(n => `<div class="news-row">
+            <span class="pill">p=${num(n.model_p_5d, 2)}</span>
+            <span class="pill">${esc(n.event_type || '—')}</span>
+            ${n.url ? `<a href="${esc(n.url)}" target="_blank" rel="noopener">${esc((n.title||'').slice(0,90))}</a>` : esc((n.title||'').slice(0,90))}
+            <span class="muted">· ${esc(n.source || '')} · ${timeAgo(n.published_at)}</span>
+          </div>`).join('')}` :
+      '<h4>Recent news</h4><div class="muted">no other signals on this ticker in last 7d</div>';
+
+    const insider = d.insider_30d || [];
+    const insiderBlock = insider.length ? `
+      <h4>Insider activity (last 30 days)</h4>
+      <table>
+        <tr><th>Date</th><th>Insider</th><th>Role</th><th>Code</th><th>Shares</th><th>Price</th></tr>
+        ${insider.map(i => `<tr>
+            <td>${esc(i.report_date)}</td>
+            <td>${esc(i.insider_name)}</td>
+            <td class="muted" style="font-size:10px">${esc(i.officer_title || (i.is_director ? 'Director' : i.is_10pct ? '10%' : '—'))}</td>
+            <td>${esc(i.transaction_code || '')} ${i.is_acquired === 1 ? '(buy)' : i.is_acquired === 0 ? '(sell)' : ''}</td>
+            <td>${num(i.shares, 0)}</td>
+            <td>${num(i.price, 2)}</td>
+          </tr>`).join('')}
+      </table>` : '';
+
+    const cat = d.upcoming_catalysts || [];
+    const catBlock = cat.length ? `
+      <h4>Upcoming catalysts (60 days)</h4>
+      <table>
+        <tr><th>Date</th><th>Type</th><th>Description</th></tr>
+        ${cat.map(c => `<tr>
+            <td>${esc(c.decision_date)}</td>
+            <td><span class="pill">${esc(c.catalyst_type)}</span></td>
+            <td>${esc(c.description || '')}</td>
+          </tr>`).join('')}
+      </table>` : '';
+
+    const earnings = d.earnings_data ? `
+      <h4>Latest earnings (${esc(d.earnings_data.report_date)})</h4>
+      <div>EPS actual ${num(d.earnings_data.eps_actual)} vs est ${num(d.earnings_data.eps_estimate)}
+        (surprise ${num(d.earnings_data.eps_surprise_pct)}%) ·
+        Rev surprise ${num(d.earnings_data.revenue_surprise_pct)}%</div>` : '';
+
+    const modelsBlock = `
+      <h4>Model predictions</h4>
+      <table>
+        <tr><th>Model</th><th>p</th></tr>
+        <tr><td>main (live recompute)</td><td>${pctFmt(mods.main && mods.main.p)}</td></tr>
+        <tr><td>graph-only (live recompute)</td><td>${pctFmt(mods.graph_only && mods.graph_only.p)}</td></tr>
+        <tr><td>stored main p_5d</td><td>${pctFmt(mods.stored_main_p_5d)}</td></tr>
+        <tr><td>model version</td><td class="muted">${esc(mods.stored_model_version || '—')}</td></tr>
+        <tr><td>bucket</td><td class="muted">${esc(mods.stored_model_bucket || '—')}</td></tr>
+      </table>`;
+
+    let cmpBlock = '';
+    if (cmp && cmp.signal_class) {
+        function dline(label, dist) {
+            if (!dist) return '';
+            return `<tr><td>${label}</td>
+                <td>${dist.samples}</td>
+                <td>${num(dist.median_return_pct, 2)}%</td>
+                <td>${num(dist.p25_return_pct, 2)}%</td>
+                <td>${num(dist.p75_return_pct, 2)}%</td>
+                <td>${num((dist.hit_rate||0)*100, 1)}%</td></tr>`;
+        }
+        cmpBlock = `
+          <h4>Comparable historical setups
+            <span class="muted" style="font-weight:normal;font-size:10px">
+              (class: ${esc(cmp.signal_class)}${cmp.used_relaxed_match ? ', relaxed match' : ''})
+            </span>
+          </h4>
+          <table>
+            <tr><th>Horizon</th><th>n</th><th>median</th><th>p25</th><th>p75</th><th>hit rate</th></tr>
+            ${dline('1d',  cmp.one_day)}
+            ${dline('5d',  cmp.five_day)}
+            ${dline('20d', cmp.twenty_day)}
+          </table>`;
+    }
+
+    return sourceBlock + modelsBlock + shapBlock + cmpBlock +
+           newsBlock + insiderBlock + catBlock + earnings;
+}
+
+// =========================================================
+// Top-level loaders
+// =========================================================
+async function loadPicks() {
+    document.getElementById('buyCards').innerHTML = '<div class="empty">loading buys…</div>';
+    document.getElementById('sellCards').innerHTML = '<div class="empty">loading sells…</div>';
+
+    const [buy, sell] = await Promise.all([
+        fetchJson(`/api/picks?direction=buy&limit=${PICK_LIMIT}&hours_window=${HOURS_WINDOW}`),
+        fetchJson(`/api/picks?direction=sell&limit=${PICK_LIMIT}&hours_window=${HOURS_WINDOW}`),
+    ]);
+
+    if (buy.error) {
+        document.getElementById('buyCards').innerHTML = `<div class="error">${esc(buy.error)}</div>`;
+    } else {
+        renderColumn('buyCards', 'buySummary', buy.picks || [], 'buy');
+        // CFD strip
+        const cfd = buy.cfd || {};
+        const el = document.getElementById('cfdStatus');
+        if (!cfd.cfd_configured) {
+            el.style.display = 'inline-block';
+            el.innerHTML = `<span class="cfd-warn">⚠ ${esc(cfd.paper_only_message || 'PAPER ONLY')}</span>`;
+        } else {
+            el.style.display = 'none';
+        }
+        // Calibration banner if buys are empty
+        const note = document.getElementById('calibrationNote');
+        if ((buy.picks || []).length === 0) {
+            note.style.display = 'block';
+            note.innerHTML = `
+              <strong>No live BUY picks today.</strong>
+              The deployed main model's max prediction on non-backfill signals in the
+              last 48h is &lt; 0.60 (the locked WATCH threshold). This is a known
+              calibration issue from the readiness audit — the model under-predicts
+              on the high end. Until calibration is fixed, the BUY column will
+              typically be empty. SELL side is unaffected.`;
+        } else {
+            note.style.display = 'none';
+        }
+    }
+    if (sell.error) {
+        document.getElementById('sellCards').innerHTML = `<div class="error">${esc(sell.error)}</div>`;
+    } else {
+        renderColumn('sellCards', 'sellSummary', sell.picks || [], 'sell');
+    }
+}
+
+async function refreshAll() {
+    await loadStatusStrip();
+    await loadPicks();
+}
+
+// Wire refresh + auto-refresh
+document.getElementById('refreshBtn').addEventListener('click', () => {
+    refreshAll();
+});
+setInterval(refreshAll, REFRESH_MS);
+
+// =========================================================
+// Live feed (5s poll) + latency footer (60s poll)
+// =========================================================
+const FEED_POLL_MS = 5000;
+const LATENCY_POLL_MS = 60000;
+
+function feedRowHtml(item) {
+    const ts = (item.scored_at || item.ingested_at || '').slice(11, 19);
+    const p = item.p;
+    let pClass = 'muted';
+    if (p != null && p >= 0.75) pClass = 'p-buy';
+    else if (p != null && p <= 0.25) pClass = 'p-sell';
+    const pText = (p == null) ? '—' : (p * 100).toFixed(1) + '%';
+    const title = esc((item.title || '').slice(0, 60));
+    const titleHtml = item.url
+        ? `<a href="${esc(item.url)}" target="_blank" rel="noopener">${title}</a>`
+        : title;
+    return `
+      <tr>
+        <td class="feed-ts">${esc(ts)}</td>
+        <td class="feed-ticker"><strong>${esc(item.ticker)}</strong></td>
+        <td class="feed-p ${pClass}">${pText}</td>
+        <td class="feed-event">${esc(item.event_type || '—')}</td>
+        <td class="feed-source">${esc(item.source || '—')}</td>
+        <td class="feed-title">${titleHtml}</td>
+      </tr>`;
+}
+
+async function loadLiveFeed() {
+    const data = await fetchJson('/api/feed?limit=20');
+    const el = document.getElementById('feedTable');
+    const sum = document.getElementById('feedSummary');
+    if (data.error) {
+        el.innerHTML = `<div class="error">${esc(data.error)}</div>`;
+        sum.textContent = 'error';
+        return;
+    }
+    const items = data.items || [];
+    sum.textContent = `${items.length} latest scored signals`;
+    if (!items.length) {
+        el.innerHTML = '<div class="empty">no scored signals yet</div>';
+        return;
+    }
+    el.innerHTML = `
+      <table class="feed-table" style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="color:var(--muted);text-align:left">
+            <th style="padding:6px 10px">time</th>
+            <th style="padding:6px 10px">ticker</th>
+            <th style="padding:6px 10px">p</th>
+            <th style="padding:6px 10px">event</th>
+            <th style="padding:6px 10px">source</th>
+            <th style="padding:6px 10px">title</th>
+          </tr>
+        </thead>
+        <tbody>${items.map(feedRowHtml).join('')}</tbody>
+      </table>`;
+}
+
+async function loadLatencyFooter() {
+    const d = await fetchJson('/api/latency_stats');
+    const el = document.getElementById('latencyFooter');
+    if (d.error) {
+        el.textContent = 'latency stats unavailable';
+        return;
+    }
+    if (!d.n) {
+        el.textContent = 'no notifications fired yet · target ingest → notify ≤ 60s';
+        return;
+    }
+    const pct = (d.pct_under_60s == null) ? '—' :
+                (d.pct_under_60s * 100).toFixed(1) + '%';
+    const mean = (d.mean_latency_s == null) ? '—' :
+                 d.mean_latency_s.toFixed(1) + 's';
+    const max  = (d.max_latency_s == null) ? '—' :
+                 d.max_latency_s.toFixed(1) + 's';
+    el.textContent =
+        `7d notifications: ${d.n} · mean latency ${mean} · max ${max} · ${pct} under 60s`;
+}
+
+// Inject minimal feed-table CSS
+(function injectFeedCss(){
+    const s = document.createElement('style');
+    s.textContent = `
+      .feed-table thead th { border-bottom: 1px solid var(--border);
+          font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+      .feed-table tbody td { padding: 6px 10px;
+          border-bottom: 1px solid var(--border); }
+      .feed-table tbody tr:hover { background: var(--panel-2); }
+      .feed-p.p-buy  { color: var(--accent-buy);  font-weight: 700; }
+      .feed-p.p-sell { color: var(--accent-sell); font-weight: 700; }
+      .feed-p.muted  { color: var(--muted); }
+      .feed-ts, .feed-source { color: var(--muted); font-size: 11px; }
+      .feed-title { color: var(--fg); }
+    `;
+    document.head.appendChild(s);
+})();
+
+loadLiveFeed();
+loadLatencyFooter();
+setInterval(loadLiveFeed, FEED_POLL_MS);
+setInterval(loadLatencyFooter, LATENCY_POLL_MS);
+
+// Initial load
+refreshAll();
+</script>
+</body>
+</html>

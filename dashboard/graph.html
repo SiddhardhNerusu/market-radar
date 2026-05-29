@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MARKET RADAR — Graph-only ranked view</title>
+<meta name="color-scheme" content="dark">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root {
+    color-scheme: dark;
+    --bg: #0b0d12;
+    --panel: #141822;
+    --panel-2: #1a1f2b;
+    --border: #243047;
+    --fg: #e8edf2;
+    --muted: #8a93a6;
+    --accent-buy: #7ad0ff;
+    --accent-sell: #ff7a7a;
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 16px 18px; background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 14px; }
+a { color: var(--accent-buy); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 1500px; margin: 0 auto; }
+
+nav { margin-bottom: 12px; font-size: 13px; }
+nav a { margin-right: 14px; font-weight: 600; }
+h1 { margin: 0 0 6px 0; font-size: 18px; color: var(--accent-buy); }
+.muted { color: var(--muted); font-size: 12px; }
+
+.columns { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; margin-top: 16px; }
+@media (max-width: 900px) { .columns { grid-template-columns: 1fr; } }
+.column { background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden; }
+.column-head { padding: 11px 14px; border-bottom: 1px solid var(--border);
+    background: var(--panel-2); display: flex; justify-content: space-between; align-items: center; }
+.column-head h2 { margin: 0; font-size: 13px; text-transform: uppercase;
+    letter-spacing: 0.04em; font-weight: 700; }
+.column.up .column-head h2 { color: var(--accent-buy); }
+.column.down .column-head h2 { color: var(--accent-sell); }
+.summary { font-size: 11px; color: var(--muted); }
+
+.card { padding: 11px 14px; border-bottom: 1px solid var(--border); cursor: pointer;
+    transition: background 0.06s; }
+.card:hover { background: var(--panel-2); }
+.card:last-child { border-bottom: 0; }
+.row1 { display: flex; align-items: center; gap: 10px; }
+.ticker { font-weight: 700; font-size: 17px; min-width: 70px; }
+.prob { font-size: 15px; font-variant-numeric: tabular-nums; margin-left: auto; }
+.column.up .prob { color: var(--accent-buy); }
+.column.down .prob { color: var(--accent-sell); }
+.chips { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { display: inline-block; padding: 2px 8px; border-radius: 11px;
+    background: #2a3346; color: var(--fg); font-size: 10px; }
+.chip.sector { background: #163020; color: #9be38f; }
+.chip.crypto { background: #2a1830; color: #e69eff; }
+
+.empty { padding: 22px 18px; color: var(--muted); font-style: italic; font-size: 13px; }
+.detail { background: var(--panel-2); border-top: 1px solid var(--border);
+    padding: 12px 16px; font-size: 12px; display: none; }
+.detail.open { display: block; }
+.detail h4 { margin: 10px 0 4px 0; font-size: 10px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.04em; }
+.detail h4:first-child { margin-top: 0; }
+.bar { display: inline-block; background: #1e4a6e; height: 10px; border-radius: 2px; }
+
+/* Lookup form */
+.lookup {
+    margin-top: 24px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px;
+}
+.lookup label { font-size: 12px; color: var(--muted); margin-right: 8px; }
+.lookup input {
+    background: var(--bg); border: 1px solid var(--border); color: var(--fg);
+    padding: 6px 10px; font-size: 14px; width: 120px; border-radius: 6px;
+}
+.lookup button {
+    background: var(--panel-2); border: 1px solid var(--accent-buy);
+    color: var(--accent-buy); padding: 6px 14px; border-radius: 6px;
+    cursor: pointer; margin-left: 8px; font-weight: 600;
+}
+.lookup button:hover { background: var(--accent-buy); color: var(--bg); }
+#lookupResult { margin-top: 14px; }
+
+.error { color: var(--accent-sell); padding: 10px;
+    background: rgba(255,122,122,0.08); border: 1px solid var(--accent-sell);
+    border-radius: 6px; margin: 10px 0; font-family: monospace; font-size: 11px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+    <nav>
+        <a href="/">← back to Picks</a>
+        <a href="/graph">Graph view</a>
+    </nav>
+    <h1>Graph-only model — ranked view</h1>
+    <div class="muted">
+        Top tickers ranked by the graph-only model (sector peers, co-mentions,
+        cross-asset, crypto sympathy — no news, no sentiment, no event type).
+        Sample drawn from the last 48 hours of live signals.
+    </div>
+
+    <div class="columns">
+        <div class="column up">
+            <div class="column-head">
+                <h2>▲ Predicted to RISE</h2>
+                <div class="summary" id="upSummary">loading…</div>
+            </div>
+            <div id="upCards"><div class="empty">loading…</div></div>
+        </div>
+        <div class="column down">
+            <div class="column-head">
+                <h2>▼ Predicted to FALL</h2>
+                <div class="summary" id="downSummary">loading…</div>
+            </div>
+            <div id="downCards"><div class="empty">loading…</div></div>
+        </div>
+    </div>
+
+    <div class="lookup">
+        <strong>Per-ticker lookup:</strong>
+        <label>Ticker
+            <input id="lookupTicker" type="text" value="AAPL" maxlength="6">
+        </label>
+        <button id="lookupBtn">Load detail</button>
+        <div id="lookupResult"></div>
+    </div>
+</div>
+
+<script>
+function esc(s){return s==null?'':String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function pct(p){return p==null||isNaN(p)?'—':(p*100).toFixed(1)+'%';}
+function num(v,d=4){return v==null||isNaN(v)?'—':Number(v).toFixed(d);}
+
+async function fetchJson(url){
+    try{const r=await fetch(url);const t=await r.text();
+        try{return JSON.parse(t);}catch(e){return{error:`HTTP ${r.status}: ${t.slice(0,200)}`};}}
+    catch(e){return{error:String(e)};}
+}
+
+function renderCard(p, direction){
+    return `
+      <div class="card" data-ticker="${esc(p.ticker)}">
+        <div class="row1">
+          <span class="ticker">$${esc(p.ticker)}</span>
+          <span class="prob">${pct(p.p)}</span>
+        </div>
+        <div class="muted" style="margin-top:3px;font-size:11px">
+          ${esc(p.event_type || '—')} · ${esc(p.source || '—')}
+        </div>
+        <div class="chips" id="chips-${esc(p.ticker)}-${direction}"></div>
+        <div class="detail" id="detail-${esc(p.ticker)}-${direction}"></div>
+      </div>`;
+}
+
+async function loadColumn(direction, container, summary){
+    const cls = direction === 'up' ? 'buy' : 'sell';
+    const data = await fetchJson(`/api/picks?direction=${cls}&limit=10&model=graph_only`);
+    const c = document.getElementById(container);
+    const s = document.getElementById(summary);
+    if (data.error){
+        c.innerHTML = `<div class="error">${esc(data.error)}</div>`;
+        s.textContent = 'error';
+        return;
+    }
+    const picks = data.picks || [];
+    if (!picks.length){
+        c.innerHTML = '<div class="empty">No graph-only picks meet the threshold today.</div>';
+        s.textContent = '0';
+        return;
+    }
+    c.innerHTML = picks.map(p => renderCard(p, direction)).join('');
+    s.textContent = `${picks.length} picks`;
+    // Enrich each with chips from /api/graph/<ticker>
+    picks.forEach(p => {
+        fetchJson(`/api/graph/${encodeURIComponent(p.ticker)}`).then(d => {
+            const el = document.getElementById(`chips-${p.ticker}-${direction}`);
+            if (!el) return;
+            const chips = [];
+            (d.sector_peers || []).slice(0,4).forEach(t => chips.push(`<span class="chip sector">${esc(t)}</span>`));
+            (d.co_mention_peers || []).slice(0,4).forEach(t => chips.push(`<span class="chip">${esc(t)}</span>`));
+            if (d.is_crypto_correlated) chips.push('<span class="chip crypto">crypto-corr</span>');
+            el.innerHTML = chips.join('') || '<span class="muted" style="font-size:10px">no peer data</span>';
+        });
+    });
+    c.querySelectorAll('.card').forEach(el => {
+        el.addEventListener('click', () => onCardClick(el, direction));
+    });
+}
+
+async function onCardClick(el, direction){
+    const t = el.dataset.ticker;
+    const detail = document.getElementById(`detail-${t}-${direction}`);
+    if (detail.classList.contains('open')){
+        detail.classList.remove('open');
+        return;
+    }
+    document.querySelectorAll('.detail.open').forEach(e => e.classList.remove('open'));
+    detail.classList.add('open');
+    detail.innerHTML = '<div class="muted">loading…</div>';
+    const d = await fetchJson(`/api/graph/${encodeURIComponent(t)}`);
+    if (d.error){ detail.innerHTML = `<div class="error">${esc(d.error)}</div>`; return; }
+    detail.innerHTML = renderDetail(d);
+}
+
+function renderDetail(d){
+    let html = '';
+    if (d.graph_only_model){
+        html += `<h4>Graph-only model</h4>
+          <div>version ${esc(d.graph_only_model.version || '—')} · val_auc ${num(d.graph_only_model.val_auc)}</div>`;
+    }
+    if (d.is_crypto_correlated){
+        html += `<h4>Crypto-correlated</h4><div>Treated as BTC-sensitive — BTC 5-day return feeds in as a feature.</div>`;
+    }
+    html += `<h4>Sector peers</h4>
+      <div>${(d.sector_peers||[]).map(t => `<span class="chip sector">${esc(t)}</span>`).join('') || '<span class="muted">none</span>'}</div>`;
+    html += `<h4>Co-mention peers (90 days)</h4>
+      <div>${(d.co_mention_peers||[]).map(t => `<span class="chip">${esc(t)}</span>`).join('') || '<span class="muted">none</span>'}</div>`;
+    if ((d.shap_top10||[]).length){
+        const max = Math.max(...d.shap_top10.map(x => x.mean_abs_shap));
+        html += `<h4>Top features driving the main model</h4>`;
+        for (const f of d.shap_top10){
+            const w = Math.max(2, Math.round(f.mean_abs_shap / max * 220));
+            html += `<div style="display:flex;gap:8px;align-items:center;margin:2px 0">
+              <span style="min-width:200px;font-size:11px">${esc(f.feature)}</span>
+              <span class="bar" style="width:${w}px"></span>
+              <span style="font-size:11px">${num(f.mean_abs_shap)}</span>
+            </div>`;
+        }
+    }
+    return html;
+}
+
+document.getElementById('lookupBtn').addEventListener('click', async () => {
+    const t = document.getElementById('lookupTicker').value.trim().toUpperCase();
+    if (!t) return;
+    const r = document.getElementById('lookupResult');
+    r.innerHTML = '<div class="muted">loading…</div>';
+    const d = await fetchJson(`/api/graph/${encodeURIComponent(t)}`);
+    if (d.error){ r.innerHTML = `<div class="error">${esc(d.error)}</div>`; return; }
+    r.innerHTML = `<h3 style="margin-bottom:8px">$${esc(t)}</h3>` + renderDetail(d);
+});
+document.getElementById('lookupTicker').addEventListener('keypress', e => {
+    if (e.key === 'Enter') document.getElementById('lookupBtn').click();
+});
+
+// Initial load
+loadColumn('up',   'upCards',   'upSummary');
+loadColumn('down', 'downCards', 'downSummary');
+</script>
+</body>
+</html>

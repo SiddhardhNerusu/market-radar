@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.marketradar.drift</string>
+  <key>ProgramArguments</key><array>
+    <string>__HOME__/Documents/Claude/Projects/MARKET RADAR/.venv/bin/python</string>
+    <string>__HOME__/Documents/Claude/Projects/MARKET RADAR/scripts/check_model_drift.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__HOME__/Documents/Claude/Projects/MARKET RADAR</string>
+  <key>StartInterval</key><integer>21600</integer>
+  <key>StandardOutPath</key><string>__HOME__/Documents/Claude/Projects/MARKET RADAR/logs/launchd-drift.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Documents/Claude/Projects/MARKET RADAR/logs/launchd-drift.err</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>

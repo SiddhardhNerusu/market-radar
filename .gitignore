@@ -1,0 +1,41 @@
+# Secrets — NEVER commit
+.env
+.env.local
+.env.bak*
+*.bak
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Data — ALL local-only (DB, trained models, snapshots, backups, hidden files)
+# 15GB+ of state. Regenerable locally. NEVER goes to GitHub.
+data/
+
+# Logs
+logs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude session caches
+.claude/
+
+# Runtime caches
+*.pickle
+*.sock

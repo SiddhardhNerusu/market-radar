@@ -9,6 +9,7 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -31,6 +32,34 @@ def _running(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _launchctl_daemon_pid() -> Optional[int]:
+    """Truth source: ask launchd directly. Returns the running PID for
+    com.marketradar.daemon, or None if not running.
+
+    Avoids false 'daemon not running' alerts when logs/daemon.pid carries
+    a stale value (e.g., from a different machine or a prior session
+    that didn't update the file).
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=5,
+        )
+        for line in out.stdout.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 3 and parts[-1] == "com.marketradar.daemon":
+                pid_str = parts[0]
+                if pid_str == "-":
+                    return None
+                try:
+                    return int(pid_str)
+                except ValueError:
+                    return None
+        return None
+    except Exception:
+        return None
 
 
 def _send_telegram(msg: str) -> bool:
@@ -108,12 +137,30 @@ def main() -> int:
     db = str(CONFIG.db_path)
     _ensure_table(db)
 
+    # TRUTH SOURCE: ask launchctl directly. The PID file can be stale
+    # (carried over from a different machine, race with daemon restart,
+    # crash before flush). launchctl knows the true PID of the running
+    # com.marketradar.daemon job. Fall back to the PID file only if
+    # launchd doesn't report the job (e.g., running manually via nohup).
+    launchd_pid = _launchctl_daemon_pid()
+    if launchd_pid is not None and _running(launchd_pid):
+        # Heal the PID file so manual scripts / dashboard still find truth.
+        try:
+            PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+            PID_FILE.write_text(f"{launchd_pid}\n")
+        except OSError:
+            pass
+        logging.info("Daemon PID %d is healthy (via launchctl)", launchd_pid)
+        return 0
+
+    # Fallback: check PID file (for manually-launched daemons).
     if not PID_FILE.exists():
-        logging.warning("daemon.pid missing")
+        logging.warning("daemon.pid missing AND launchctl reports no daemon")
         if _last_alert_minutes_ago(db) > COOLDOWN_MIN:
             if _send_telegram(
                 "⚠️ <b>MARKET RADAR — daemon not running</b>\n"
-                "logs/daemon.pid file is missing"
+                "launchctl shows no com.marketradar.daemon AND "
+                "logs/daemon.pid is missing"
             ):
                 _record(db, "missing_pid")
         return 1
@@ -131,21 +178,20 @@ def main() -> int:
         return 1
 
     if not _running(pid):
-        logging.warning("Daemon PID %d is not running", pid)
+        logging.warning("Daemon PID %d is not running (also not in launchctl)", pid)
         if _last_alert_minutes_ago(db) > COOLDOWN_MIN:
             restart_cmd = (
-                "cd ~/Documents/Claude/Projects/MARKET\\ RADAR && "
-                "nohup .venv/bin/python scripts/run_daemon.py &"
+                "launchctl kickstart -k gui/$(id -u)/com.marketradar.daemon"
             )
             if _send_telegram(
                 f"⚠️ <b>MARKET RADAR — daemon not running</b>\n"
-                f"PID {pid} not alive. Restart with:\n"
-                f"<code>{restart_cmd}</code>"
+                f"PID {pid} dead, launchctl reports no daemon either. "
+                f"Restart with:\n<code>{restart_cmd}</code>"
             ):
                 _record(db, "pid_dead")
         return 1
 
-    logging.info("Daemon PID %d is healthy", pid)
+    logging.info("Daemon PID %d is healthy (via PID file fallback)", pid)
     return 0
 
 

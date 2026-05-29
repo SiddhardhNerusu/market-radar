@@ -8,8 +8,11 @@
     <string>__HOME__/Documents/Claude/Projects/MARKET RADAR/scripts/scheduled_retrain.py</string>
   </array>
   <key>WorkingDirectory</key><string>__HOME__/Documents/Claude/Projects/MARKET RADAR</string>
+  <!-- DAILY retrain at 04:00 UTC (pre-market). Continuously absorbs
+       fresh outcomes as they resolve overnight. Each run auto-deploys
+       if AUC holds; the AUC-gate in scripts/scheduled_retrain.py
+       refuses deployment if a retrain degrades model quality. -->
   <key>StartCalendarInterval</key><dict>
-    <key>Weekday</key><integer>0</integer>
     <key>Hour</key><integer>4</integer>
     <key>Minute</key><integer>0</integer>
   </dict>

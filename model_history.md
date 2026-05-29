@@ -1,0 +1,18 @@
+# MARKET RADAR — Model retrain history
+
+Auto-appended by `scripts/scheduled_retrain.py`. Each entry records what changed and whether the new model deployed.
+
+---
+
+## 2026-05-29 18:34 UTC
+
+- **Exit code**: 0 (success)
+- **Old model**: `20260529T175456Z` (val_auc=0.6148)
+- **New model**: `20260529T183900Z` (val_auc=0.6144)
+- **Deployed**: YES
+- **Horizon**: 5 day
+- **Train rows**: 116712 / **Val rows**: 23342
+- **Log file**: `retrain-20260529-1834.log`
+
+---
+

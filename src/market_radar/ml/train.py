@@ -459,6 +459,11 @@ def _load_training_rows(*, require_horizon: str = "return_5d_pct") -> list[dict]
             LEFT JOIN llm_classifications lc
                    ON lc.signal_id = ss.signal_id AND lc.ticker = ss.ticker
             WHERE so.{require_horizon} IS NOT NULL
+              -- Outlier filter: stock splits / reverse splits / ticker
+              -- reuse can show 1,000%+ returns (e.g., INRE 3,002,400%).
+              -- These poison the model's notion of "winners." Filter to
+              -- realistic ranges only.
+              AND ABS(so.{require_horizon}) < 50.0
             """
         ).fetchall()
     return [dict(r) for r in rows]

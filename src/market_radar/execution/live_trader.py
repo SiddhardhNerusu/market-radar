@@ -1773,12 +1773,21 @@ class LiveTrader:
         # second still get distinct IDs (the previous per-second suffix
         # collided on retry storms and Alpaca 422'd them).
         client_order_id = f"mr-s{score_id}-{_t_mod.time_ns()}"
-        self._persist_decision(
+        pending_id = self._persist_decision(
             cand, gate_passed=True, gate_reason=gate.reason,
             risk_passed=True, risk_reason="ok",
             outcome="pending_submit", outcome_detail=client_order_id,
             sized=sized,
         )
+        # SAFETY: never submit an order we couldn't record. A missing decision
+        # row means no SL/TP tracking → an unmanaged position. If persist
+        # failed (0 / None), abort this candidate rather than open a naked
+        # position. (Caused 2 unmanaged crypto positions on 2026-05-30.)
+        if not pending_id:
+            log.error("[%s] pending_submit persist failed (no row) — ABORTING "
+                      "submit to avoid an unmanaged position. score_id=%s",
+                      symbol, score_id)
+            return
 
         # Crypto branch: Alpaca does NOT support bracket orders on crypto.
         # Submit a simple market order; stop/TP enforcement is handled by
@@ -1873,6 +1882,17 @@ class LiveTrader:
         risk_blocking_rule: Optional[str] = None,
         alpaca_order_id: Optional[str] = None,
     ) -> int:
+        # CRITICAL: bot_decisions.model_p + composite_score are NOT NULL.
+        # PA signals (and some news signals) arrive with model_p=None before
+        # the ML predict job fills it. Passing None made INSERT OR IGNORE
+        # SILENTLY skip the row — so a placed crypto position got NO decision
+        # row, hence NO SL/TP for _poll_crypto_exits → unmanaged position.
+        # Coerce to safe defaults (0.5 = neutral, matching the rest of the
+        # candidate-processing code which does the same).
+        safe_model_p = cand.get("model_p")
+        safe_model_p = float(safe_model_p) if safe_model_p is not None else 0.5
+        safe_composite = cand.get("composite_score")
+        safe_composite = float(safe_composite) if safe_composite is not None else 0.0
         with get_connection() as conn:
             cur = conn.execute(
                 """
@@ -1885,8 +1905,12 @@ class LiveTrader:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (cand["score_id"], cand["symbol"],
-                 self._pick_direction(cand["model_p"], cand.get("sentiment")) or "buy",
-                 cand["model_p"], cand["composite_score"],
+                 self._pick_direction(
+                     safe_model_p, cand.get("sentiment"),
+                     cand.get("signal_source"), cand.get("symbol"),
+                     composite=safe_composite, event_type=cand.get("event_type"),
+                     factual=cand.get("factual")) or "buy",
+                 safe_model_p, safe_composite,
                  int(gate_passed), gate_reason, int(risk_passed), risk_reason,
                  risk_blocking_rule,
                  None, sized.size_pct if sized else None,
@@ -1898,6 +1922,19 @@ class LiveTrader:
                  sized.atr if sized else None,
                  outcome, outcome_detail, alpaca_order_id, utc_now()),
             )
+            if cur.rowcount == 0:
+                # Row was IGNORED (existing score_id) — that's fine for the
+                # idempotency case. But warn if we somehow lost a brand-new
+                # row so this silent-skip class of bug surfaces in logs.
+                existing = conn.execute(
+                    "SELECT id FROM bot_decisions WHERE score_id=?",
+                    (cand["score_id"],),
+                ).fetchone()
+                if not existing:
+                    log.error("[%s] _persist_decision INSERT skipped AND no existing "
+                              "row for score_id=%s — decision NOT recorded!",
+                              cand.get("symbol"), cand["score_id"])
+                return existing[0] if existing else 0
             return cur.lastrowid
 
     def _persist_order(

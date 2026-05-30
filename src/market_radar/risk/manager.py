@@ -231,7 +231,7 @@ class RiskManager:
         else:
             effective_cap = (CONFIG.risk_max_gross_exposure_usd
                              - CONFIG.risk_options_reserve_usd)
-        if gross_after > effective_cap:
+        if gross_after > effective_cap + 1.0:  # $1 rounding slack
             return RiskDecision(
                 False,
                 f"Gross exposure ${gross_after:.0f} would exceed "
@@ -249,7 +249,7 @@ class RiskManager:
             else:
                 crypto_now = self._current_crypto_exposure_usd() or 0.0
             crypto_after = crypto_now + new_position_usd
-            if crypto_after > CONFIG.risk_max_crypto_exposure_usd:
+            if crypto_after > CONFIG.risk_max_crypto_exposure_usd + 1.0:  # $1 slack
                 return RiskDecision(
                     False,
                     f"Crypto exposure ${crypto_after:.0f} would exceed "
@@ -272,7 +272,11 @@ class RiskManager:
             existing_ticker_usd = self._current_ticker_exposure_usd(ticker, t.kind)
         total_ticker_usd = existing_ticker_usd + new_position_usd
         total_ticker_pct = (total_ticker_usd / account_equity_usd) * 100.0
-        if total_ticker_pct > per_ticker_cap:
+        # Epsilon tolerance: the sizer clamps notional to EXACTLY the cap
+        # (e.g. $678 = 6.0% of $11,300), but crypto qty rounding to 6 decimals
+        # can tick the notional a few cents over, making 6.0000009% > 6.0 and
+        # rejecting a legitimately-capped trade. Allow 0.1pp of slack.
+        if total_ticker_pct > per_ticker_cap + 0.1:
             return RiskDecision(
                 False,
                 f"Ticker exposure ${total_ticker_usd:.0f} "

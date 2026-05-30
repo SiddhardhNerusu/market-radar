@@ -74,12 +74,23 @@ def size_trade(
     tp_atr_mult: float = TP_ATR_MULT,
     min_qty: float = MIN_QTY,
     allow_fractional: bool = False,
+    true_equity_usd: Optional[float] = None,
 ) -> SizingResult:
-    """Return a sized, bracketed proposal — or a non-tradeable explanation."""
+    """Return a sized, bracketed proposal — or a non-tradeable explanation.
+
+    ``account_equity_usd`` may be multiplier-inflated (conviction × regime ×
+    learning × earnings). ``true_equity_usd`` is the un-inflated equity used
+    to enforce the HARD per-ticker cap: multipliers scale size TOWARD the cap
+    but can never push the final notional past max_pct of TRUE equity. Without
+    this clamp the sizer produced e.g. 7.8% positions that the risk manager
+    then rejected ("Ticker exposure exceeds per-ticker cap 6.0%"). Falls back
+    to account_equity_usd when not provided (legacy behavior).
+    """
     max_pct = (
         max_position_pct if max_position_pct is not None
         else CONFIG.risk_max_position_pct
     )
+    cap_equity = true_equity_usd if true_equity_usd is not None else account_equity_usd
 
     if entry_price <= 0:
         return _untradeable("entry_price <= 0", entry_price, atr, 0.0)
@@ -117,6 +128,13 @@ def size_trade(
 
     size_pct = min(kelly_raw * kelly_fraction * 100.0, max_pct)
     notional = account_equity_usd * (size_pct / 100.0)
+    # HARD CAP: never let multiplier-inflated equity push the position past
+    # max_pct of TRUE equity (what the risk manager's per-ticker rule checks).
+    # Multipliers scale size toward the cap, never beyond it.
+    hard_cap_notional = cap_equity * (max_pct / 100.0)
+    if notional > hard_cap_notional:
+        notional = hard_cap_notional
+        size_pct = (notional / cap_equity) * 100.0 if cap_equity > 0 else size_pct
     qty = notional / entry_price
 
     # Integer shares for stocks (bracket orders require whole shares).

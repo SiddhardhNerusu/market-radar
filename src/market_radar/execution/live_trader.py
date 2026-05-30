@@ -1597,6 +1597,9 @@ class LiveTrader:
             tp_atr_mult=self.cfg.stock_tp_atr_mult,
             allow_fractional=is_crypto_sym,
             min_qty=(0.0001 if is_crypto_sym else 1.0),
+            # Hard per-ticker cap binds on TRUE equity so multipliers can't
+            # inflate a position past 6% and get it rejected by the risk gate.
+            true_equity_usd=eff_equity,
         )
         if conf_reasons or regime_mult != 1.0 or learn_mult != 1.0 or earnings_mult != 1.0:
             log.info(

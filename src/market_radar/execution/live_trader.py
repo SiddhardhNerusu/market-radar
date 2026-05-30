@@ -1578,7 +1578,18 @@ class LiveTrader:
         # PA signals: use the synthetic high-conviction p for sizing too,
         # otherwise Kelly produces tiny sizes ($135) because PA signals'
         # model_p is centered around 0.42-0.45.
-        sizing_p = (0.70 if direction == "buy" else 0.30) if is_pa_signal else p
+        # CRITICAL: p in the Kelly formula = probability THIS TRADE wins
+        # (not probability of UP). For shorts, our confidence is 0.70 in
+        # the bet (= 0.30 confidence in UP). Using 0.30 here would give
+        # negative kelly_raw and block every PA short signal. Pass 0.70
+        # for BOTH directions when PA-confident.
+        if is_pa_signal:
+            sizing_p = 0.70
+        else:
+            # For ML/news signals: if direction is sell, the bet wins
+            # when price goes DOWN. p (model_p_5d) represents P(up), so
+            # P(bet wins) = 1 - p for shorts.
+            sizing_p = p if direction == "buy" else (1.0 - p)
         sized = size_trade(
             direction=direction, entry_price=entry, atr=atr,
             calibrated_p=sizing_p, account_equity_usd=adjusted_equity,

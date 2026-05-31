@@ -292,6 +292,23 @@ class LiveTrader:
         except Exception as exc:  # noqa: BLE001
             log.error("[HALT ALERT] failed to send: %s", exc)
 
+    def _add_pending_exposure(self, symbol: str, notional: float, is_crypto: bool) -> None:
+        """Record a just-submitted order's notional so later candidates in the
+        SAME loop iteration see it in their risk checks (the positions snapshot
+        is loop-start-stale). Fail-safe: no-ops if the per-loop dict is absent."""
+        p = getattr(self, "_loop_pending", None)
+        if p is None:
+            return
+        try:
+            n = float(notional or 0)
+            p["gross"] = p.get("gross", 0.0) + n
+            if is_crypto:
+                p["crypto"] = p.get("crypto", 0.0) + n
+            key = symbol.replace("/", "").upper()
+            p["ticker"][key] = p["ticker"].get(key, 0.0) + n
+        except Exception:  # noqa: BLE001 — never let bookkeeping break a submit
+            pass
+
     def _load_daily_tp_state(self) -> None:
         """Restore _daily_tp_fired_on / peak from DB so restarts don't reopen
         after we've already locked the day. Uses bot_daily_pnl.tp_fired column
@@ -841,6 +858,14 @@ class LiveTrader:
             return
         log.info("Found %d candidate(s).", len(candidates))
 
+        # Within-loop stacking guard: reset per-iteration pending exposure.
+        # The `positions` snapshot is taken once at loop start, so without this
+        # each candidate is blind to positions opened EARLIER in the same loop
+        # and the crypto/gross/per-ticker caps can be breached in one iteration
+        # (7 crypto = $3,100 vs the $2,000 cap on 2026-05-28). Each successful
+        # submit adds to this; later candidates' risk checks include it.
+        self._loop_pending = {"gross": 0.0, "crypto": 0.0, "ticker": {}}
+
         for cand in candidates[: self.cfg.max_candidates_per_loop]:
             try:
                 self._process_candidate(cand, account=account,
@@ -1388,6 +1413,10 @@ class LiveTrader:
                 ).fetchone()
                 option_gross = float(_opt_row[0]) if _opt_row else 0.0
             alpaca_gross = stock_crypto_gross + option_gross
+        # Stacking guard: include gross from orders already submitted this loop.
+        _pend = getattr(self, "_loop_pending", None)
+        if _pend and alpaca_gross is not None:
+            alpaca_gross += _pend.get("gross", 0.0)
         decision = self.risk.evaluate(
             proposal,
             account_equity_usd=self._effective_equity(account),
@@ -1452,6 +1481,9 @@ class LiveTrader:
         self._persist_option_spread(
             decision_id=decision_id, spec=spec, sizing=sizing, mleg=mleg,
         )
+        # Stacking guard: this spread's debit isn't 'filled' in the DB yet, so
+        # later candidates this loop would miss it on the gross cap. Record it.
+        self._add_pending_exposure(symbol, sizing.total_debit_usd, False)
         log.info(
             "OPTIONS SUBMITTED %s %s %s  K=%s/%s exp=%s  qty=%d  "
             "debit=$%.2f net=$%.0f  max_gain=$%.0f  order_id=%s",
@@ -1815,6 +1847,16 @@ class LiveTrader:
                 ).fetchone()
                 option_gross = float(_opt_row[0]) if _opt_row else 0.0
             alpaca_gross = stock_crypto_gross + option_gross
+        # Fold in same-loop pending exposure (stacking guard) so this candidate
+        # sees orders already submitted earlier THIS iteration.
+        _pend = getattr(self, "_loop_pending", None)
+        if _pend and alpaca_gross is not None:
+            alpaca_gross += _pend.get("gross", 0.0)
+            if alpaca_crypto is not None:
+                alpaca_crypto += _pend.get("crypto", 0.0)
+            if alpaca_ticker is not None:
+                alpaca_ticker += _pend.get("ticker", {}).get(
+                    symbol.replace("/", "").upper(), 0.0)
         decision = self.risk.evaluate(
             proposal,
             account_equity_usd=self._effective_equity(account),
@@ -2001,6 +2043,9 @@ class LiveTrader:
                 (cand["score_id"],),
             ).fetchone()
             decision_id = row[0] if row else None
+        # Stacking guard: record this submit's notional for later candidates
+        # this loop (the positions snapshot won't reflect it yet).
+        self._add_pending_exposure(symbol, sized.notional_usd, is_crypto_order)
         if decision_id is not None and not is_crypto_order:
             self._persist_order(bracket, sized=sized, direction=direction,
                                 symbol=symbol, decision_id=decision_id)
@@ -2156,16 +2201,18 @@ class LiveTrader:
             log.warning("_book_crypto_exit_pnl(%s) failed: %s", pair, exc)
 
     def _poll_crypto_exits(self, positions) -> None:
-        """Poll open positions and close at SL/TP from bot_decisions.
+        """Poll open CRYPTO positions and close at SL/TP from bot_decisions.
 
-        Covers BOTH:
-        - Crypto positions (no Alpaca-side brackets available — broker limit)
-        - Stock positions whose Alpaca brackets were cancelled (e.g. by EOD
-          flatten or cancel_all_orders) — backfilled SL/TP in bot_decisions
-
-        Skips option contract legs (managed by _poll_option_exits).
+        Crypto has no Alpaca-side bracket orders (broker limit), so this poller
+        IS its only SL/TP/trailing exit. The SL/TP lookup and the price fetch
+        below are crypto-specific (pair form + get_latest_crypto_trade), so this
+        covers crypto only. Stocks rely on their Alpaca bracket, the EOD flatten,
+        and the daily loss-stop; option legs are managed by _poll_option_exits.
+        (Earlier docstring claimed stock-bracket recovery here — it never did;
+        true stock re-protection would need separate stock price/close logic.)
         """
-        # Filter: include crypto + stocks, EXCLUDE option contracts (long symbols)
+        # Filter: crypto pairs only (short symbols), EXCLUDE option contracts.
+        # The SL/TP query below further restricts to ticker LIKE '%/%'.
         eligible = [p for p in positions if len(p.symbol) <= 15]
         if not eligible:
             return

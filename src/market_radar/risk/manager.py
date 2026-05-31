@@ -106,6 +106,7 @@ class RiskManager:
         current_notional_usd: Optional[float] = None,
         current_crypto_usd: Optional[float] = None,
         current_ticker_usd: Optional[float] = None,
+        market_open: bool = True,
     ) -> RiskDecision:
         # Input sanity — fail closed on malformed proposals.
         if not isinstance(t, TradeProposal):
@@ -243,17 +244,24 @@ class RiskManager:
         # Rule 6b: crypto-only ceiling. Crypto trades 24/7 and would fill the
         # entire gross budget overnight before US-session stocks/options ever
         # see a candidate. Hard cap forces crypto to be selective.
+        # WEEKEND: when the US market is closed, the stock+options budget is
+        # idle, so crypto is allowed a higher ceiling to put that capital to
+        # work. Reverts automatically the moment the market opens; the Monday
+        # pre-open trim brings exposure back to the weekday cap.
         if t.kind == "crypto":
+            crypto_cap = (CONFIG.risk_max_crypto_exposure_usd if market_open
+                          else CONFIG.risk_max_crypto_exposure_weekend_usd)
             if current_crypto_usd is not None:
                 crypto_now = float(current_crypto_usd)
             else:
                 crypto_now = self._current_crypto_exposure_usd() or 0.0
             crypto_after = crypto_now + new_position_usd
-            if crypto_after > CONFIG.risk_max_crypto_exposure_usd + 1.0:  # $1 slack
+            if crypto_after > crypto_cap + 1.0:  # $1 slack
                 return RiskDecision(
                     False,
                     f"Crypto exposure ${crypto_after:.0f} would exceed "
-                    f"${CONFIG.risk_max_crypto_exposure_usd:.0f} (crypto-only cap)",
+                    f"${crypto_cap:.0f} (crypto-only cap, "
+                    f"{'market-open' if market_open else 'weekend'})",
                     "max_crypto_exposure",
                 )
 

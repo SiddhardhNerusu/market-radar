@@ -75,6 +75,7 @@ def size_trade(
     min_qty: float = MIN_QTY,
     allow_fractional: bool = False,
     true_equity_usd: Optional[float] = None,
+    max_notional_usd: Optional[float] = None,
 ) -> SizingResult:
     """Return a sized, bracketed proposal — or a non-tradeable explanation.
 
@@ -134,6 +135,14 @@ def size_trade(
     hard_cap_notional = cap_equity * (max_pct / 100.0)
     if notional > hard_cap_notional:
         notional = hard_cap_notional
+        size_pct = (notional / cap_equity) * 100.0 if cap_equity > 0 else size_pct
+    # SIZE-TO-FIT: if a budget headroom is supplied (remaining crypto / gross /
+    # per-ticker room), size DOWN to fit instead of rejecting. "Don't leave
+    # money unworked" — a high-conviction signal that doesn't fit at 6% still
+    # gets whatever % the remaining budget allows, as long as it clears the
+    # minimum tradeable size below.
+    if max_notional_usd is not None and notional > max_notional_usd:
+        notional = max(max_notional_usd, 0.0)
         size_pct = (notional / cap_equity) * 100.0 if cap_equity > 0 else size_pct
     qty = notional / entry_price
 

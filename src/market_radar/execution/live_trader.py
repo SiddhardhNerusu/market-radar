@@ -722,6 +722,15 @@ class LiveTrader:
         # Step 3: market clock — skip stock trading when closed (unless after-hours allowed)
         market_open = self.alpaca.is_market_open()
 
+        # Step 3a: WEEKEND→WEEKDAY crypto trim. When the market is open, crypto
+        # reverts to its weekday ceiling so stocks+options have full budget.
+        # Trim any weekend-built crypto excess back down once per open.
+        try:
+            if market_open:
+                self._trim_crypto_to_weekday_cap(positions)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Crypto weekday-trim failed: %s", exc)
+
         # Step 3b: macro regime gate. PANIC halts everything; bearish/bullish
         # adjust size + direction permissions for the loop.
         regime = None
@@ -1472,6 +1481,22 @@ class LiveTrader:
             )
             return
 
+        # WEEKEND CRYPTO CONVICTION GATE: when the US market is closed and
+        # crypto gets the higher capital ceiling, only fire on the STRONGEST
+        # setups (composite >= 7.5 AND |sentiment| >= 0.5) instead of the
+        # weekday 6.5/0.3 bar. More capital deployed → demand more conviction.
+        if is_crypto and not market_open:
+            _comp = float(cand.get("composite_score") or 0.0)
+            _sent = abs(float(cand.get("sentiment") or 0.0))
+            if _comp < 7.5 or _sent < 0.5:
+                self._persist_decision(
+                    cand, gate_passed=False,
+                    gate_reason=f"weekend_low_conviction (comp={_comp:.1f}, |sent|={_sent:.1f})",
+                    risk_passed=False, risk_reason="weekend_conviction_bar",
+                    outcome="gate_blocked",
+                )
+                return
+
         # LATE-DAY GUARD: don't open new stock positions in the last 30 minutes.
         # EOD flatten fires at 5min-to-close which kills our P&L if we just
         # opened — TPs need time to mature. Crypto is exempt (24/7).
@@ -1590,6 +1615,36 @@ class LiveTrader:
             # when price goes DOWN. p (model_p_5d) represents P(up), so
             # P(bet wins) = 1 - p for shorts.
             sizing_p = p if direction == "buy" else (1.0 - p)
+
+        # SIZE-TO-FIT: compute remaining budget headroom BEFORE sizing so a
+        # high-conviction signal that doesn't fit at the full 6% still gets
+        # whatever the remaining crypto / gross / per-ticker budget allows.
+        # No capital sits idle. Headroom = None means "no positions snapshot",
+        # so fall back to unconstrained (risk gate still backstops).
+        max_notional = None
+        if positions is not None:
+            cur_crypto = sum(abs(float(pp.market_value)) for pp in positions
+                             if pp.symbol.upper().endswith("USD") and len(pp.symbol) <= 9)
+            cur_stock_crypto = sum(abs(float(pp.market_value)) for pp in positions
+                                   if len(pp.symbol) <= 9)
+            with get_connection() as _hc:
+                _r = _hc.execute("SELECT COALESCE(SUM(total_debit_usd),0) "
+                                 "FROM bot_option_spreads WHERE closed_at IS NULL "
+                                 "AND status='filled'").fetchone()
+                cur_opt = float(_r[0]) if _r else 0.0
+            cur_gross = cur_stock_crypto + cur_opt
+            from ..config import CONFIG as _CFG
+            headrooms = []
+            # Gross budget (non-option proposals share gross minus options reserve)
+            non_opt_cap = _CFG.risk_max_gross_exposure_usd - _CFG.risk_options_reserve_usd
+            headrooms.append(non_opt_cap - cur_gross)
+            # Crypto ceiling (weekend vs weekday)
+            if is_crypto_sym:
+                crypto_cap = (_CFG.risk_max_crypto_exposure_usd if market_open
+                              else _CFG.risk_max_crypto_exposure_weekend_usd)
+                headrooms.append(crypto_cap - cur_crypto)
+            max_notional = max(min(headrooms), 0.0)
+
         sized = size_trade(
             direction=direction, entry_price=entry, atr=atr,
             calibrated_p=sizing_p, account_equity_usd=adjusted_equity,
@@ -1600,6 +1655,8 @@ class LiveTrader:
             # Hard per-ticker cap binds on TRUE equity so multipliers can't
             # inflate a position past 6% and get it rejected by the risk gate.
             true_equity_usd=eff_equity,
+            # Size-to-fit remaining budget so no capital sits idle.
+            max_notional_usd=max_notional,
         )
         if conf_reasons or regime_mult != 1.0 or learn_mult != 1.0 or earnings_mult != 1.0:
             log.info(
@@ -1672,6 +1729,7 @@ class LiveTrader:
             current_notional_usd=sized.notional_usd,
             current_crypto_usd=alpaca_crypto,
             current_ticker_usd=alpaca_ticker,
+            market_open=market_open,
         )
         if not decision.allowed:
             self._persist_decision(
@@ -2643,6 +2701,58 @@ class LiveTrader:
         except Exception:  # noqa: BLE001
             pass
         return True
+
+    def _trim_crypto_to_weekday_cap(self, positions) -> None:
+        """When the US market opens, bring crypto exposure back to the weekday
+        ceiling so stocks + options have their full budget. Trims the excess
+        by partially selling the largest crypto positions first. Fires at most
+        once per market-open transition (tracked via _crypto_trimmed_on).
+
+        Honors the user's "squash crypto before Monday open" instruction so
+        the multi-asset day-trader starts the session with room for all three.
+        """
+        from datetime import date as _date
+        today = _date.today()
+        if getattr(self, "_crypto_trimmed_on", None) == today:
+            return
+        if not positions:
+            self._crypto_trimmed_on = today
+            return
+        from ..config import CONFIG as _CFG
+        weekday_cap = _CFG.risk_max_crypto_exposure_usd
+        crypto = [p for p in positions
+                  if p.symbol.upper().endswith("USD") and len(p.symbol) <= 9]
+        total = sum(abs(float(p.market_value)) for p in crypto)
+        if total <= weekday_cap + 1.0:
+            self._crypto_trimmed_on = today
+            return
+        excess = total - weekday_cap
+        log.warning("🔻 Crypto weekday-trim: %d positions total $%.0f > weekday cap "
+                    "$%.0f — trimming $%.0f for stock/option budget",
+                    len(crypto), total, weekday_cap, excess)
+        import time as _t_trim
+        # Sell from largest positions first until excess is covered.
+        for p in sorted(crypto, key=lambda x: abs(float(x.market_value)), reverse=True):
+            if excess <= 1.0:
+                break
+            mv = abs(float(p.market_value))
+            qty = abs(float(p.qty))
+            sell_mv = min(mv, excess)
+            sell_qty = round(sell_mv / mv * qty, 6) if mv > 0 else 0
+            if sell_qty <= 0:
+                continue
+            slashed = _normalize_ticker(p.symbol.upper())
+            try:
+                self.alpaca.submit_simple_order(
+                    symbol=slashed, side="sell", qty=sell_qty,
+                    order_type="market", time_in_force="gtc",
+                    client_order_id=f"mr-wktrim-{slashed.replace('/','')[:6]}-{_t_trim.time_ns()}",
+                )
+                log.info("  trimmed %s: sold %.6f (~$%.0f)", slashed, sell_qty, sell_mv)
+                excess -= sell_mv
+            except AlpacaError as exc:
+                log.warning("  crypto trim failed for %s: %s", slashed, exc)
+        self._crypto_trimmed_on = today
 
     def _eod_flatten_if_due(self, positions) -> None:
         """Close all stock positions + day-trader option spreads

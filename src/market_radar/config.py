@@ -84,10 +84,15 @@ class Config:
     # Non-option proposals (stocks, crypto) cap at (gross - reserve). Ensures
     # the highest-EV path (debit spreads) always has budget.
     risk_options_reserve_usd: float = 2500.0
-    # Crypto-only ceiling: crypto positions can't exceed this absolute $ value.
-    # Forces crypto selectivity, prevents 24/7 crypto from monopolizing the
-    # gross budget before US-session stocks/options can compete.
+    # Crypto-only ceiling: crypto positions can't exceed this absolute $ value
+    # WHILE THE US MARKET IS OPEN. Forces crypto selectivity so it doesn't
+    # monopolize the gross budget before US-session stocks/options compete.
     risk_max_crypto_exposure_usd: float = 2000.0
+    # Weekend / market-closed crypto ceiling: when stocks + options can't
+    # trade, the stock+options budget sits idle, so crypto is allowed to use
+    # more capital. Reverts to the weekday ceiling (above) the moment the US
+    # market opens, and the Monday pre-open trim brings exposure back down.
+    risk_max_crypto_exposure_weekend_usd: float = 5000.0
     # Monthly drawdown halt: if equity drops this much below 30-day rolling
     # peak, halt all trading and require manual review. Catches structural
     # issues (broken strategy, bad config) before they compound.
@@ -161,6 +166,7 @@ def load_config() -> Config:
         risk_emergency_stop=_bool(os.getenv("RISK_EMERGENCY_STOP"), False),
         risk_options_reserve_usd=_float(os.getenv("RISK_OPTIONS_RESERVE_USD"), 2500.0),
         risk_max_crypto_exposure_usd=_float(os.getenv("RISK_MAX_CRYPTO_EXPOSURE_USD"), 2000.0),
+        risk_max_crypto_exposure_weekend_usd=_float(os.getenv("RISK_MAX_CRYPTO_EXPOSURE_WEEKEND_USD"), 5000.0),
         risk_monthly_drawdown_usd=_float(os.getenv("RISK_MONTHLY_DRAWDOWN_USD"), 2000.0),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),

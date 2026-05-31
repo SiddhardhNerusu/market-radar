@@ -147,6 +147,13 @@ class TraderConfig:
         "material_event_amend", "activist_position",
     )
 
+    # Hard-block list of negative-EV signal SOURCES (prefix-matched via
+    # rs.source LIKE 'source%'). 2026-05-31 audit found stocktwits_trending
+    # had significantly negative measured EV (-1.96% avg return, t=-16.5) —
+    # it injects noise, not edge. Excluded at the candidate query so these
+    # never reach a trade decision. Add sources here as audits find them.
+    blocked_sources: tuple[str, ...] = ("stocktwits",)
+
     @classmethod
     def from_env(cls) -> "TraderConfig":
         import os
@@ -187,6 +194,10 @@ class TraderConfig:
             daily_profit_take_usd=_f("LIVE_DAILY_TP_USD", 0.0),
             daily_tp_arm_at_usd=_f("LIVE_DAILY_TP_ARM_USD", 190.0),
             daily_tp_giveback_usd=_f("LIVE_DAILY_TP_GIVEBACK_USD", 40.0),
+            blocked_sources=tuple(
+                s.strip() for s in os.getenv("LIVE_BLOCKED_SOURCES", "stocktwits").split(",")
+                if s.strip()
+            ),
         )
 
 
@@ -230,6 +241,10 @@ class LiveTrader:
         # Current macro regime — set at the top of each run_once(), nullable
         self._current_regime = None
         self._stop = False
+        # Silent-halt alerting: map global-halt rule -> Eastern date last alerted,
+        # so a persistent halt (loop runs every 30s) alerts ONCE per rule per day
+        # instead of spamming. Only account-wide halts alert (not per-trade blocks).
+        self._halt_alerted: dict[str, str] = {}
         # PERSISTENCE: load daily TP fired flag from DB so restarts respect "halted today"
         self._load_daily_tp_state()
         log.info(
@@ -241,6 +256,41 @@ class LiveTrader:
             self.cfg.dry_run,
             "PAPER" if "paper" in self.alpaca.base_url else "LIVE",
         )
+
+    # Account-wide halts that silently stop ALL trading. Per-trade blocks
+    # (per-ticker cap, min_p, sector, gross) are NOT in this set — they're
+    # normal and would spam. Only these three mean "the bot has stopped".
+    _GLOBAL_HALT_RULES = {"emergency_stop", "daily_loss_cap", "monthly_drawdown"}
+
+    def _maybe_alert_halt(self, blocking_rule: Optional[str], reason: str) -> None:
+        """Telegram alert the FIRST time an account-wide halt blocks a trade
+        today. Without this, the bot can sit halted (loss cap hit, drawdown,
+        emergency stop) all day and the user never knows trading stopped."""
+        if not blocking_rule or blocking_rule not in self._GLOBAL_HALT_RULES:
+            return
+        today = _us_eastern_date().isoformat()
+        if self._halt_alerted.get(blocking_rule) == today:
+            return  # already alerted for this rule today
+        self._halt_alerted[blocking_rule] = today
+        labels = {
+            "emergency_stop": "🛑 EMERGENCY STOP",
+            "daily_loss_cap": "🛑 DAILY LOSS CAP HIT",
+            "monthly_drawdown": "🛑 MONTHLY DRAWDOWN HALT",
+        }
+        title = labels.get(blocking_rule, f"🛑 HALT [{blocking_rule}]")
+        body = (
+            f"<b>{title}</b>\n"
+            f"All trading is now halted for the rest of today.\n"
+            f"<i>{reason}</i>\n"
+            f"Existing positions keep their SL/TP. The bot resumes "
+            f"automatically next session unless the cap is still breached."
+        )
+        try:
+            from ..notifications.realtime import _send_telegram_simple
+            _send_telegram_simple(body)
+            log.warning("[HALT ALERT] %s — %s", blocking_rule, reason)
+        except Exception as exc:  # noqa: BLE001
+            log.error("[HALT ALERT] failed to send: %s", exc)
 
     def _load_daily_tp_state(self) -> None:
         """Restore _daily_tp_fired_on / peak from DB so restarts don't reopen
@@ -1037,6 +1087,20 @@ class LiveTrader:
             blocked_event_clause = ""
             blocked_event_params = ()
 
+        # Drop negative-EV sources entirely (prefix match). This is a TOP-LEVEL
+        # exclusion — applied no matter which bypass arm a signal would hit —
+        # so a blocked source can never reach a trade decision. NULL sources
+        # are kept (only an explicit prefix match is excluded).
+        if self.cfg.blocked_sources:
+            src_clauses = " AND ".join(
+                ["(rs.source IS NULL OR rs.source NOT LIKE ?)"] * len(self.cfg.blocked_sources)
+            )
+            blocked_source_clause = f"AND ({src_clauses})"
+            blocked_source_params = tuple(f"{s}%" for s in self.cfg.blocked_sources)
+        else:
+            blocked_source_clause = ""
+            blocked_source_params = ()
+
         # Use the configured signal horizon (1d for day-trading, 5d for swing).
         # Falls back to model_p_5d if the chosen horizon's column is NULL.
         horizon_col = {
@@ -1106,6 +1170,7 @@ class LiveTrader:
                   AND COALESCE(ss.source_weight, 0) >= ?
                   AND ss.scored_at >= ?
                   AND bd.id IS NULL
+                  {blocked_source_clause}
                   AND (
                        (
                          {p_expr} IS NOT NULL
@@ -1130,6 +1195,7 @@ class LiveTrader:
                     self.cfg.composite_threshold,
                     self.cfg.min_source_weight,
                     cutoff_iso,
+                    *blocked_source_params,
                     self.cfg.direction_p_buy_min,
                     self.cfg.direction_p_sell_max,
                     *blocked_event_params,
@@ -1325,6 +1391,7 @@ class LiveTrader:
             )
             log.info("[%s OPT] RISK BLOCKED [%s]: %s",
                      symbol, decision.blocking_rule, decision.reason)
+            self._maybe_alert_halt(decision.blocking_rule, decision.reason)
             return
 
         # Dry-run mode
@@ -1755,6 +1822,7 @@ class LiveTrader:
             )
             log.info("[%s] RISK BLOCKED [%s]: %s",
                      symbol, decision.blocking_rule, decision.reason)
+            self._maybe_alert_halt(decision.blocking_rule, decision.reason)
             return
 
         # Submit (or dry-run)

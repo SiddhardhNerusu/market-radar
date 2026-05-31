@@ -67,6 +67,8 @@ class OptionQuote:
     ask: float
     bid_size: int = 0
     ask_size: int = 0
+    last_price: float = 0.0
+    last_trade_ts: Optional[str] = None
     implied_volatility: Optional[float] = None
     delta: Optional[float] = None
     gamma: Optional[float] = None
@@ -78,6 +80,19 @@ class OptionQuote:
     @property
     def mid(self) -> float:
         return (self.bid + self.ask) / 2 if (self.bid > 0 and self.ask > 0) else 0.0
+
+    @property
+    def effective_mid(self) -> float:
+        """Real two-sided mid if available, else the last trade price. The
+        'indicative' options feed frequently returns no resting quote even on
+        liquid strikes (this was ~44% of failed builds). Spread orders are
+        LIMIT at the net debit, so falling back to last trade can only cause a
+        no-fill or a fill at our limit-or-better — never a worse-than-quoted
+        fill."""
+        m = self.mid
+        if m > 0:
+            return m
+        return self.last_price if self.last_price > 0 else 0.0
 
     @property
     def spread_pct(self) -> float:
@@ -235,6 +250,7 @@ class AlpacaOptionsClient:
             snaps = (d or {}).get("snapshots", {}) or {}
             for sym, snap in snaps.items():
                 q = snap.get("latestQuote") or {}
+                lt = snap.get("latestTrade") or {}
                 greeks = snap.get("greeks") or {}
                 under = snap.get("underlyingPrice")
                 out[sym] = OptionQuote(
@@ -243,6 +259,8 @@ class AlpacaOptionsClient:
                     ask=float(q.get("ap", 0) or 0),
                     bid_size=int(q.get("bs", 0) or 0),
                     ask_size=int(q.get("as", 0) or 0),
+                    last_price=float(lt.get("p", 0) or 0),
+                    last_trade_ts=lt.get("t"),
                     implied_volatility=snap.get("impliedVolatility"),
                     delta=greeks.get("delta"),
                     gamma=greeks.get("gamma"),

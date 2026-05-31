@@ -15,6 +15,7 @@ else gets routed to the stock path by the live trader's dispatcher.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Literal, Optional
@@ -78,6 +79,15 @@ MIN_DTE_DAYS = 0                      # allow 0DTE on SPY/QQQ/IWM
 MAX_DTE_DAYS = 2                      # cap day-trader at 2 DTE max
 MIN_OPEN_INTEREST = 25                # liquid enough to enter + exit (was 100, dropped to fire more spreads)
 MAX_SPREAD_PCT = 0.25                 # reject if (ask-bid)/mid > 25% (was 10/15, relaxed for paper)
+
+# When the indicative options feed returns no two-sided quote (bid=ask=0) —
+# which was ~44% of failed builds — fall back to the leg's last trade price.
+# Safe because the spread is submitted as a LIMIT at the net debit: a stale
+# estimate yields a no-fill or a fill at our limit-or-better, never worse.
+# Flip to 0 in .env to revert to quote-only (no-fill on empty quotes).
+ALLOW_LAST_TRADE_MID = os.getenv(
+    "LIVE_OPT_ALLOW_LAST_TRADE_MID", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -270,18 +280,39 @@ def build_vertical_debit_spread(
     short_q = quotes.get(short_c.symbol)
     if not long_q or not short_q:
         return None, _untradeable_sizing("no quote for one of the legs")
-    if long_q.mid <= 0 or short_q.mid <= 0:
-        return None, _untradeable_sizing(
-            f"degenerate mid: long={long_q.mid}, short={short_q.mid}"
+    # ---- Price each leg: real two-sided mid, else last-trade fallback ----
+    if ALLOW_LAST_TRADE_MID:
+        long_mid = long_q.effective_mid
+        short_mid = short_q.effective_mid
+    else:
+        long_mid, short_mid = long_q.mid, short_q.mid
+    if long_mid <= 0 or short_mid <= 0:
+        # Diagnostic: log the actual quote+trade so we can SEE whether empty
+        # quotes are illiquid strikes (correct to skip) or a feed gap (the
+        # last-trade fallback rescues these). Was ~44% of failed builds.
+        log.info(
+            "[%s] spread skipped — no price: long bid/ask/last=%.2f/%.2f/%.2f "
+            "short bid/ask/last=%.2f/%.2f/%.2f (fallback=%s)",
+            ticker, long_q.bid, long_q.ask, long_q.last_price,
+            short_q.bid, short_q.ask, short_q.last_price, ALLOW_LAST_TRADE_MID,
         )
-    if long_q.spread_pct > MAX_SPREAD_PCT or short_q.spread_pct > MAX_SPREAD_PCT:
         return None, _untradeable_sizing(
-            f"bid-ask too wide: long={long_q.spread_pct:.1%}, "
-            f"short={short_q.spread_pct:.1%}, max={MAX_SPREAD_PCT:.1%}"
+            f"no price (quote+last empty): long={long_mid:.2f} short={short_mid:.2f}"
+        )
+    # Bid-ask width sanity — only meaningful on a leg with a real two-sided
+    # quote. A last-trade-only leg has no computable spread; the LIMIT order
+    # is our protection there.
+    if long_q.mid > 0 and long_q.spread_pct > MAX_SPREAD_PCT:
+        return None, _untradeable_sizing(
+            f"long bid-ask too wide: {long_q.spread_pct:.1%} > {MAX_SPREAD_PCT:.1%}"
+        )
+    if short_q.mid > 0 and short_q.spread_pct > MAX_SPREAD_PCT:
+        return None, _untradeable_sizing(
+            f"short bid-ask too wide: {short_q.spread_pct:.1%} > {MAX_SPREAD_PCT:.1%}"
         )
 
     # ---- Debit + max gain ----
-    debit_per_spread = max(long_q.mid - short_q.mid, 0.01)  # per share; * 100 for $
+    debit_per_spread = max(long_mid - short_mid, 0.01)  # per share; * 100 for $
     if debit_per_spread >= width:
         return None, _untradeable_sizing(
             f"debit {debit_per_spread:.2f} >= width {width:.2f} — no edge"
@@ -309,7 +340,7 @@ def build_vertical_debit_spread(
     if spec.reward_risk_ratio > 10.0:
         return None, _untradeable_sizing(
             f"R:R {spec.reward_risk_ratio:.1f} > 10 — likely bad quote "
-            f"(long_mid={long_q.mid:.2f}, short_mid={short_q.mid:.2f})"
+            f"(long_mid={long_mid:.2f}, short_mid={short_mid:.2f})"
         )
     sizing = size_spread(spec, model_p=model_p, account_equity_usd=account_equity_usd,
                          composite_score=composite_score, abs_sentiment=abs_sentiment)

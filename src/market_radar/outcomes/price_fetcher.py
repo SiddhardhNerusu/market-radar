@@ -1,25 +1,23 @@
-"""Free-tier price fetcher built on yfinance.
+"""Price fetcher for the outcome tracker.
 
-We snapshot the *current* mid/last price for a list of tickers in batches.
-For history (1d/5d/20d), we query Yahoo's historical bars and pick the
-closing price at the appropriate trading day.
+Primary source is **Alpaca** (the same broker the bot trades through): it's
+reliable, authenticated, and not rate-limited for our volume. yfinance is
+kept ONLY as a fallback for symbols Alpaca can't price (non-US listings).
 
-Notes:
-  - yfinance can be flaky. We retry once with exponential backoff and
-    return None for tickers we can't price.
-  - Non-US tickers (UK ".L", Frankfurt ".DE", etc.) require a yfinance
-    suffix we don't currently map. v1 supports US only; non-US tickers
-    are returned as None so the outcome row is still created and can be
-    backfilled later.
-  - We never crash the caller — every method returns either a value or
-    None.
+History: this used to be yfinance-only, which rate-limited so aggressively
+that ~85% of 1d/5d/20d outcomes never resolved — the ML model was training
+on almost no labeled data. Switching to Alpaca-first unblinds the learning
+loop (the bot's whole edge depends on it).
+
+Contract (unchanged): every method returns either a value or None and never
+crashes the caller.
 """
 from __future__ import annotations
 
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 try:
@@ -65,65 +63,102 @@ def _normalize_ticker(ticker: str) -> Optional[str]:
     return raw
 
 
+def _alpaca_symbol(ticker: str) -> Optional[str]:
+    """Map an internal ticker to an Alpaca symbol, or None if Alpaca can't
+    price it (non-US listing). Crypto pairs ('BTC/USD') pass through; T212
+    shapes are stripped; US dotted tickers use Alpaca's '.' convention
+    (BRK.B, not yfinance's BRK-B)."""
+    if not ticker:
+        return None
+    raw = ticker.strip().upper()
+    if "/" in raw:
+        return raw  # crypto pair, e.g. BTC/USD
+    if "_" in raw:
+        parts = raw.split("_")
+        if len(parts) >= 3 and parts[-1] in {"EQ", "ETF", "STK"}:
+            exch = parts[-2]
+            sym = "_".join(parts[:-2])
+            if exch == "US":
+                return sym.replace("_", ".")  # Alpaca uses BRK.B
+            return None  # non-US — let yfinance handle it
+        return None
+    return raw  # plain symbol — assume US equity
+
+
 @dataclass
 class PriceSnapshot:
     ticker: str
     price: Optional[float]
     timestamp_iso: str
-    source: str = "yfinance"
+    source: str = "alpaca"
 
 
 class PriceFetcher:
-    """Free price fetcher with batching and retry."""
+    """Alpaca-first price fetcher with yfinance fallback."""
 
-    def __init__(self, max_retries: int = 1, retry_backoff: float = 2.0) -> None:
-        if not YF_AVAILABLE:
-            log.warning(
-                "yfinance not installed — PriceFetcher will always return None. "
-                "Add `yfinance` to requirements.txt and pip install."
-            )
+    def __init__(
+        self,
+        max_retries: int = 1,
+        retry_backoff: float = 2.0,
+        alpaca_client=None,
+    ) -> None:
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        self._alpaca = alpaca_client
+        self._alpaca_failed = False
+        if not YF_AVAILABLE:
+            log.info("yfinance not installed — PriceFetcher will rely on Alpaca only.")
+
+    # ------------------------------------------------------------------
+
+    @property
+    def alpaca(self):
+        """Lazily build an AlpacaClient. If creds are missing the fetcher
+        silently degrades to yfinance-only (never crashes the tracker)."""
+        if self._alpaca is None and not self._alpaca_failed:
+            try:
+                from ..execution.alpaca_client import AlpacaClient
+                self._alpaca = AlpacaClient()
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "PriceFetcher: Alpaca client unavailable (%s) — yfinance only", exc
+                )
+                self._alpaca_failed = True
+        return self._alpaca
 
     # ------------------------------------------------------------------
 
     def fetch_latest(self, tickers: list[str]) -> dict[str, PriceSnapshot]:
-        """Return ``{original_ticker: PriceSnapshot}`` for as many as possible."""
+        """Return ``{original_ticker: PriceSnapshot}`` for as many as possible.
+
+        Alpaca last-trade first (per ticker), yfinance batch for the rest."""
         out: dict[str, PriceSnapshot] = {}
-        if not tickers or not YF_AVAILABLE:
-            now = _utc_now_iso()
-            for t in tickers:
-                out[t] = PriceSnapshot(t, None, now)
+        if not tickers:
             return out
-
-        # Normalize and build (yf_symbol → list[original_ticker]) groups
-        groups: dict[str, list[str]] = {}
-        unmapped: list[str] = []
-        for t in tickers:
-            yf_sym = _normalize_ticker(t)
-            if yf_sym is None:
-                unmapped.append(t)
-                continue
-            groups.setdefault(yf_sym, []).append(t)
-
         now_iso = _utc_now_iso()
-        for orig in unmapped:
-            out[orig] = PriceSnapshot(orig, None, now_iso)
 
-        if not groups:
-            return out
+        # --- Pass 1: Alpaca last trade ---
+        needs_yf: list[str] = []
+        client = self.alpaca
+        for t in tickers:
+            asym = _alpaca_symbol(t) if client is not None else None
+            price = None
+            if asym is not None:
+                try:
+                    price = client.get_latest_trade(asym)
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("alpaca latest %s failed: %s", asym, exc)
+                    price = None
+            if price and price > 0:
+                out[t] = PriceSnapshot(t, float(price), now_iso, source="alpaca")
+            else:
+                needs_yf.append(t)
 
-        symbols = list(groups.keys())
-        prices = self._batch_last_prices(symbols)
-        for yf_sym, price in prices.items():
-            for orig in groups.get(yf_sym, []):
-                out[orig] = PriceSnapshot(orig, price, now_iso)
-
-        # Tickers we batched for but didn't get a price back for
-        for yf_sym, originals in groups.items():
-            for orig in originals:
-                if orig not in out:
-                    out[orig] = PriceSnapshot(orig, None, now_iso)
+        # --- Pass 2: yfinance fallback for whatever Alpaca missed ---
+        if needs_yf:
+            yf_prices = self._yf_fetch_latest(needs_yf)
+            for t in needs_yf:
+                out[t] = yf_prices.get(t, PriceSnapshot(t, None, now_iso, source="none"))
         return out
 
     def fetch_closing_on_or_after(
@@ -133,17 +168,80 @@ class PriceFetcher:
     ) -> Optional[tuple[float, str]]:
         """Return (close, iso_ts) of the first trading day on/after ``target_date``.
 
-        Used to look up 1d / 5d / 20d post-flag prices.
-        """
+        Used to look up 1d / 5d / 20d post-flag prices. Alpaca daily bars
+        first; yfinance fallback if Alpaca can't price the symbol."""
+        # --- Alpaca daily bars ---
+        client = self.alpaca
+        asym = _alpaca_symbol(ticker) if client is not None else None
+        if asym is not None:
+            try:
+                start_dt = target_date.astimezone(timezone.utc)
+                end_dt = start_dt + timedelta(days=10)  # weekends + holidays room
+                bars = client.get_daily_bars(
+                    asym,
+                    start=start_dt.strftime("%Y-%m-%d"),
+                    end=end_dt.strftime("%Y-%m-%d"),
+                    limit=10,
+                )
+                for bar in bars:
+                    close = float(bar.get("c", 0) or 0)
+                    if close > 0:
+                        ts = str(bar.get("t") or "")
+                        if not ts:
+                            ts = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        return close, ts
+            except Exception as exc:  # noqa: BLE001
+                log.debug("alpaca daily bars %s failed: %s", asym, exc)
+
+        # --- yfinance fallback ---
+        return self._yf_closing_on_or_after(ticker, target_date)
+
+    # ------------------------------------------------------------------
+    # yfinance fallback paths (kept for non-US symbols Alpaca can't price)
+    # ------------------------------------------------------------------
+
+    def _yf_fetch_latest(self, tickers: list[str]) -> dict[str, PriceSnapshot]:
+        out: dict[str, PriceSnapshot] = {}
+        now_iso = _utc_now_iso()
+        if not tickers or not YF_AVAILABLE:
+            for t in tickers:
+                out[t] = PriceSnapshot(t, None, now_iso, source="none")
+            return out
+
+        groups: dict[str, list[str]] = {}
+        unmapped: list[str] = []
+        for t in tickers:
+            yf_sym = _normalize_ticker(t)
+            if yf_sym is None:
+                unmapped.append(t)
+                continue
+            groups.setdefault(yf_sym, []).append(t)
+
+        for orig in unmapped:
+            out[orig] = PriceSnapshot(orig, None, now_iso, source="none")
+
+        if not groups:
+            return out
+
+        prices = self._batch_last_prices(list(groups.keys()))
+        for yf_sym, price in prices.items():
+            for orig in groups.get(yf_sym, []):
+                out[orig] = PriceSnapshot(orig, price, now_iso, source="yfinance")
+        for yf_sym, originals in groups.items():
+            for orig in originals:
+                if orig not in out:
+                    out[orig] = PriceSnapshot(orig, None, now_iso, source="none")
+        return out
+
+    def _yf_closing_on_or_after(
+        self, ticker: str, target_date: datetime,
+    ) -> Optional[tuple[float, str]]:
         yf_sym = _normalize_ticker(ticker)
         if not yf_sym or not YF_AVAILABLE:
             return None
-
         try:
-            # Fetch ~5 trading days starting from target_date
-            from datetime import timedelta
             start = target_date.astimezone(timezone.utc)
-            end = start + timedelta(days=10)  # gives us weekends + holidays room
+            end = start + timedelta(days=10)
             hist = yf.Ticker(yf_sym).history(
                 start=start.strftime("%Y-%m-%d"),
                 end=end.strftime("%Y-%m-%d"),
@@ -156,7 +254,6 @@ class PriceFetcher:
 
         if hist is None or hist.empty:
             return None
-
         try:
             first_row = hist.iloc[0]
             close = float(first_row["Close"])
@@ -166,8 +263,6 @@ class PriceFetcher:
             return close, ts
         except (KeyError, IndexError, ValueError):
             return None
-
-    # ------------------------------------------------------------------
 
     def _batch_last_prices(self, symbols: list[str]) -> dict[str, Optional[float]]:
         """Hit yfinance once for a batch of symbols. Returns last close price."""
@@ -179,7 +274,6 @@ class PriceFetcher:
         while attempt <= self.max_retries:
             attempt += 1
             try:
-                # yf.download for batches is faster than per-ticker calls
                 df = yf.download(
                     tickers=" ".join(symbols),
                     period="2d",

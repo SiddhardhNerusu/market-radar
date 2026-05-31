@@ -133,7 +133,10 @@ _CHECKPOINTS: list[tuple[int, str, str]] = [
 # with no give-up, so it retried the same ~200 oldest rows forever — delisted
 # backfill tickers no source can price — and never reached resolvable recent
 # signals, leaving the model with zero fresh labels.
-MAX_RESOLVE_ATTEMPTS = 4       # quarantine a row after this many failed fetches
+MAX_RESOLVE_ATTEMPTS = 8       # quarantine after this many failures WITH NO success
+                               # in between (the counter resets to 0 on any
+                               # successful checkpoint write — so only genuinely
+                               # dead rows, which never resolve, ever quarantine).
 MAX_RESOLVE_AGE_DAYS = 90      # anchors older than this, still unresolved = dead
 
 
@@ -227,6 +230,7 @@ def update_due_outcomes(
                            SET {price_col} = ?,
                                {ts_col}    = ?,
                                return_{window_days}d_pct = ?,
+                               resolve_attempts = 0,
                                fully_resolved = CASE
                                    WHEN ? = 'price_20d' THEN 1
                                    ELSE fully_resolved

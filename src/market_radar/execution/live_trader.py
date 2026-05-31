@@ -772,6 +772,14 @@ class LiveTrader:
         except Exception as exc:  # noqa: BLE001
             log.exception("Crypto flip check failed: %s", exc)
 
+        # Day rollover: clear the per-day TP/loss notification flag so the first
+        # fire of a NEW day actually alerts. The flag is set on fire and never
+        # otherwise reset, and the trader is a long-lived process — without this,
+        # day-2+ loss-stop/TP Telegram alerts are silently suppressed.
+        from datetime import date as _roll_date
+        if getattr(self, "_daily_tp_fired_on", None) != _roll_date.today():
+            self._daily_tp_notified = False
+
         # Step 2c: EOD flatten — close stock positions before market close
         try:
             self._eod_flatten_if_due(positions)
@@ -2695,11 +2703,25 @@ class LiveTrader:
         flattens everything + halts the day the moment intraday P&L (realized +
         unrealized = equity - last_equity) breaches the cap.
 
+        ONLY active during the equities session. Alpaca's `last_equity` is the
+        PRIOR equities close, so `equity - last_equity` overnight/over a weekend
+        includes 24/7 crypto drift (the bot holds crypto when the market is shut)
+        — NOT a real intraday loss. Firing then would liquidate the crypto book
+        at an illiquid off-hours mark on benign noise. Crypto is protected by its
+        own per-position SL/TP/trailing exits while the market is closed.
+
         Returns True if we just fired (caller should skip the rest of the loop)."""
         from datetime import date as _date
         from ..config import CONFIG
         cap = abs(float(CONFIG.risk_daily_loss_cap_usd or 0))
         if cap <= 0:
+            return False
+        # Session gate — see docstring. On a clock-check failure, do NOT fire
+        # (avoid the off-hours false-fire); EOD flatten + per-position stops remain.
+        try:
+            if not self.alpaca.is_market_open():
+                return False
+        except Exception:  # noqa: BLE001
             return False
         today = _date.today()
         # Already halted today — let the profit-take retry path own leftover

@@ -1471,6 +1471,20 @@ class LiveTrader:
         score_id = cand["score_id"]
         is_pa_signal = (cand.get("signal_source") or "").startswith("price_action_")
 
+        # CRYPTO-NO-SHORT GUARD: Alpaca spot crypto cannot be shorted. A
+        # bearish PA signal produces direction='sell', which bypasses the
+        # macro-regime short veto for crypto and reaches submit — where
+        # Alpaca returns 403 ("cannot short"). This was burning ~32 crypto
+        # signals/day into execution_failed rows (and the generic 403
+        # message masked the real cause). Short-circuit BEFORE sizing/submit.
+        if "/" in symbol and direction == "sell":
+            self._persist_decision(
+                cand, gate_passed=False, gate_reason="crypto_no_short",
+                risk_passed=False, risk_reason="alpaca_spot_crypto_no_short",
+                outcome="gate_blocked", outcome_detail="crypto_short_not_supported",
+            )
+            return
+
         # Market hours
         is_crypto = symbol in self.cfg.crypto_tickers or "/" in symbol
         if not is_crypto and not market_open and not self.cfg.allow_after_hours:
@@ -2031,6 +2045,36 @@ class LiveTrader:
     # 50% of max loss, whichever fires first. Time-stop at 1-DTE avoids
     # pin risk + assignment.
     # ------------------------------------------------------------------
+    def _book_crypto_exit_pnl(self, conn, pair: str, qty: float,
+                              entry: float, pnl: float) -> None:
+        """Mark the crypto position's bot_orders row CLOSED with realized P/L.
+
+        Without this, crypto exits booked P/L to bot_daily_pnl but left the
+        bot_orders row status='filled', realized_pnl_usd=NULL forever — a
+        phantom 'open' position that inflated the risk manager's DB-based
+        exposure math (10 phantom rows = $4,561 vs $1,374 real) and slowly
+        starved trading. Matches both ticker forms (BTC/USD and BTCUSD).
+        """
+        try:
+            norm = pair.replace("/", "").upper()
+            conn.execute(
+                """
+                UPDATE bot_orders
+                SET realized_pnl_usd = ?,
+                    pnl_pct = ?,
+                    exit_reason = 'crypto_exit',
+                    canceled_at = ?
+                WHERE UPPER(ticker) IN (?, ?)
+                  AND status = 'filled'
+                  AND realized_pnl_usd IS NULL
+                """,
+                (pnl,
+                 (pnl / (abs(qty) * entry)) if (qty and entry) else 0.0,
+                 utc_now(), pair.upper(), norm),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("_book_crypto_exit_pnl(%s) failed: %s", pair, exc)
+
     def _poll_crypto_exits(self, positions) -> None:
         """Poll open positions and close at SL/TP from bot_decisions.
 
@@ -2152,6 +2196,7 @@ class LiveTrader:
                     pnl = (entry - current_price) * qty
                 with get_connection() as conn:
                     self._update_daily_pnl(conn, pnl)
+                    self._book_crypto_exit_pnl(conn, pair, qty, entry, pnl)
                 try:
                     from ..notifications.realtime import TradeAlert, notify_trade
                     headline = None
@@ -2276,6 +2321,12 @@ class LiveTrader:
                     client_order_id=f"mr-flip-{slashed.replace('/','')[:6]}-{_t_flip.time_ns()}",
                 )
                 self._recent_flips[slashed] = now_ts
+                # Book realized P/L so the bot_orders row closes (no phantom).
+                _flip_pnl = float(p.unrealized_pl)
+                with get_connection() as _fc:
+                    self._update_daily_pnl(_fc, _flip_pnl)
+                    self._book_crypto_exit_pnl(_fc, slashed, abs(float(p.qty)),
+                                               float(p.avg_entry_price), _flip_pnl)
             except AlpacaError as exc:
                 log.error("CRYPTO FLIP close failed for %s: %s", slashed, exc)
 

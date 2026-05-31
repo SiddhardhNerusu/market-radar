@@ -761,6 +761,18 @@ class LiveTrader:
         except Exception as exc:  # noqa: BLE001
             log.exception("EOD flatten failed: %s", exc)
 
+        # Step 2c2: Daily LOSS stop — hard intraday kill-switch. The risk gate's
+        # daily_loss_cap only blocks NEW trades and counts realized P&L only, so
+        # an underwater book can blow past the cap before EOD (2026-05-29 lost
+        # -$1,953 ≈ 4x the $500 cap). Flatten + halt the moment intraday
+        # (realized + unrealized) breaches the cap.
+        try:
+            if self._daily_loss_stop_if_due(account, positions):
+                log.error("Daily LOSS stop fired. Flattened + halted for the day.")
+                return
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Daily loss-stop check failed: %s", exc)
+
         # Step 2d: Daily profit-take — if intraday P&L exceeds cap, flatten + halt
         try:
             if self._daily_profit_take_if_due(account, positions):
@@ -2628,6 +2640,41 @@ class LiveTrader:
         except Exception:  # noqa: BLE001
             return None
 
+    def _daily_loss_stop_if_due(self, account, positions) -> bool:
+        """Hard intraday loss kill-switch (the loss-side mirror of the daily
+        profit-take). The risk gate's daily_loss_cap only BLOCKS NEW trades and
+        counts REALIZED P&L only — so a deeply underwater book can blow far past
+        the cap before EOD flatten (2026-05-29: -$1,953 ≈ 4x the $500 cap). This
+        flattens everything + halts the day the moment intraday P&L (realized +
+        unrealized = equity - last_equity) breaches the cap.
+
+        Returns True if we just fired (caller should skip the rest of the loop)."""
+        from datetime import date as _date
+        from ..config import CONFIG
+        cap = abs(float(CONFIG.risk_daily_loss_cap_usd or 0))
+        if cap <= 0:
+            return False
+        today = _date.today()
+        # Already halted today — let the profit-take retry path own leftover
+        # positions; don't run a second competing flatten here.
+        if getattr(self, "_daily_tp_fired_on", None) == today:
+            return False
+        intraday = float(account.equity - account.last_equity)
+        if intraday <= -cap:
+            log.error(
+                "🛑 DAILY LOSS STOP: intraday $%.2f <= -$%.2f — flattening + halting for the day",
+                intraday, cap,
+            )
+            try:
+                self._maybe_alert_halt(
+                    "daily_loss_cap",
+                    f"intraday P&L ${intraday:.0f} <= -${cap:.0f} — flattened + halted",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return self._fire_daily_flatten(positions, intraday, f"loss_stop_${intraday:.0f}")
+        return False
+
     def _daily_profit_take_if_due(self, account, positions) -> bool:
         """Two modes (both check intraday = realized + unrealized P&L):
 
@@ -2798,12 +2845,16 @@ class LiveTrader:
                     self._update_daily_pnl(conn, pnl)
 
         # Telegram alert — ONLY on first fire of the day, NOT on retries.
-        # Retries spam the user with identical messages.
+        # Retries spam the user with identical messages. P&L-sign-aware so a
+        # loss-stop fire (intraday_pnl < 0) reads as a loss halt, not a "TP hit".
         if mode != "retry" and not getattr(self, "_daily_tp_notified", False):
             self._daily_tp_notified = True
             try:
                 from ..notifications.realtime import TradeAlert, notify_trade
-                note = f"🎯 DAILY TP — closed {len(closed_syms)}/{attempted}, locked +${intraday_pnl:.2f}"
+                if intraday_pnl >= 0:
+                    note = f"🎯 DAILY TP — closed {len(closed_syms)}/{attempted}, locked +${intraday_pnl:.2f}"
+                else:
+                    note = f"🛑 DAILY LOSS STOP — closed {len(closed_syms)}/{attempted}, halted at ${intraday_pnl:.2f}"
                 if remaining:
                     note += f" ({len(remaining)} retrying)"
                 notify_trade(TradeAlert(
@@ -2811,14 +2862,6 @@ class LiveTrader:
                 ))
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            from ..notifications.realtime import TradeAlert, notify_trade
-            notify_trade(TradeAlert(
-                kind="PNL_DAY", symbol="ALL", pnl_usd=intraday,
-                extra=f"🎯 DAILY TP HIT — flattened {closed} positions, locked +${intraday:.2f}",
-            ))
-        except Exception:  # noqa: BLE001
-            pass
         return True
 
     def _trim_crypto_to_weekday_cap(self, positions) -> None:

@@ -129,6 +129,26 @@ _CHECKPOINTS: list[tuple[int, str, str]] = [
     (20, "price_20d", "price_20d_ts"),
 ]
 
+# Poison-pill guards (2026-05-31). The resolver used to ORDER BY anchor ASC
+# with no give-up, so it retried the same ~200 oldest rows forever — delisted
+# backfill tickers no source can price — and never reached resolvable recent
+# signals, leaving the model with zero fresh labels.
+MAX_RESOLVE_ATTEMPTS = 4       # quarantine a row after this many failed fetches
+MAX_RESOLVE_AGE_DAYS = 90      # anchors older than this, still unresolved = dead
+
+
+def _bump_attempts(conn, outcome_id) -> None:
+    """Increment a row's failed-resolve counter so persistently-unresolvable
+    rows get quarantined (see MAX_RESOLVE_ATTEMPTS) instead of retried forever."""
+    try:
+        conn.execute(
+            "UPDATE signal_outcomes "
+            "SET resolve_attempts = COALESCE(resolve_attempts, 0) + 1 WHERE id = ?",
+            (outcome_id,),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("resolve_attempts bump failed for %s: %s", outcome_id, exc)
+
 
 def update_due_outcomes(
     *,
@@ -140,13 +160,18 @@ def update_due_outcomes(
     fetcher = fetcher or PriceFetcher()
 
     now = datetime.now(timezone.utc)
+    # Anchors older than this that are STILL unresolved are dead (delisted / no
+    # forward bars anywhere) — skip so the loop reaches the resolvable backlog.
+    floor_iso = (now - timedelta(days=MAX_RESOLVE_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     for window_days, price_col, ts_col in _CHECKPOINTS:
         target = now - timedelta(days=window_days)
         target_iso = target.strftime("%Y-%m-%dT%H:%M:%SZ")
         with get_connection() as conn:
-            # Candidates: outcomes whose anchor is at least N days old and
-            # don't have this checkpoint yet.
+            # Candidates: outcomes whose anchor is N+ days old, lack this
+            # checkpoint, haven't exhausted resolve attempts, and aren't
+            # ancient-dead. The attempt/age guards break the poison-pill that
+            # starved the model of fresh labels.
             rows = conn.execute(
                 f"""
                 SELECT id AS outcome_id, score_id, ticker, price_at_flag,
@@ -155,10 +180,12 @@ def update_due_outcomes(
                 WHERE {price_col} IS NULL
                   AND price_at_flag_ts IS NOT NULL
                   AND price_at_flag_ts <= ?
+                  AND price_at_flag_ts >= ?
+                  AND COALESCE(resolve_attempts, 0) < ?
                 ORDER BY price_at_flag_ts ASC
                 LIMIT ?
                 """,
-                (target_iso, batch_size),
+                (target_iso, floor_iso, MAX_RESOLVE_ATTEMPTS, batch_size),
             ).fetchall()
 
             attr = f"candidates_{window_days}d"
@@ -175,12 +202,14 @@ def update_due_outcomes(
                 except (TypeError, ValueError):
                     log.warning("bad anchor ts on outcome %s: %r", row["outcome_id"], anchor_ts)
                     stats.failed += 1
+                    _bump_attempts(conn, row["outcome_id"])
                     continue
 
                 target_date = anchor_dt + timedelta(days=window_days)
                 lookup = fetcher.fetch_closing_on_or_after(row["ticker"], target_date)
                 if lookup is None:
                     stats.failed += 1
+                    _bump_attempts(conn, row["outcome_id"])
                     continue
                 close, close_ts = lookup
 

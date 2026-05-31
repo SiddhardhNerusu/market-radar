@@ -120,6 +120,11 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         ("notifications_sent", "channels_sent", "TEXT"),
         ("notifications_sent", "ingested_at", "TEXT"),
         ("notifications_sent", "latency_seconds", "REAL"),
+        # Outcome-tracker poison-pill guard (2026-05-31): count failed resolve
+        # attempts so permanently-dead rows (delisted tickers no source can
+        # price) get quarantined instead of being retried forever — which
+        # starved the resolvable recent backlog and kept the model unlabeled.
+        ("signal_outcomes", "resolve_attempts", "INTEGER DEFAULT 0"),
     ]
     for table, column, coltype in needed:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}

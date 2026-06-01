@@ -245,6 +245,10 @@ class LiveTrader:
         # so a persistent halt (loop runs every 30s) alerts ONCE per rule per day
         # instead of spamming. Only account-wide halts alert (not per-trade blocks).
         self._halt_alerted: dict[str, str] = {}
+        # SELECTIVE loss-stop halt flag (Eastern/local date). SEPARATE from
+        # _daily_tp_fired_on so the loss-stop can keep winners open without the
+        # profit-take retry flattening them. Reset on day rollover in run_once.
+        self._daily_loss_halt_on = None
         # PERSISTENCE: load daily TP fired flag from DB so restarts respect "halted today"
         self._load_daily_tp_state()
         log.info(
@@ -790,6 +794,12 @@ class LiveTrader:
         from datetime import date as _roll_date
         if getattr(self, "_daily_tp_fired_on", None) != _roll_date.today():
             self._daily_tp_notified = False
+        # Reset the SELECTIVE loss-stop halt on day rollover too. It's a separate
+        # flag (see _daily_loss_stop_if_due) and, like _daily_tp_fired_on, is set
+        # on trigger and never otherwise cleared — without this, a loss-halt on
+        # one day would silently block all new entries forever after.
+        if getattr(self, "_daily_loss_halt_on", None) != _roll_date.today():
+            self._daily_loss_halt_on = None
 
         # Step 2c: EOD flatten — close stock positions before market close
         try:
@@ -853,10 +863,18 @@ class LiveTrader:
 
         self._current_regime = regime  # used downstream for sizing + direction filter
 
-        # If daily profit-take already fired today, do not open new trades
+        # If daily profit-take fired OR the selective loss-stop halted today, do
+        # not open new trades. Two SEPARATE flags by design: the loss-stop keeps
+        # winners open (so it must NOT set _daily_tp_fired_on, which would make
+        # the profit-take retry flatten them) but still halts new entries here.
         from datetime import date as _date
-        if getattr(self, "_daily_tp_fired_on", None) == _date.today():
+        _today = _date.today()
+        if getattr(self, "_daily_tp_fired_on", None) == _today:
             log.debug("Daily TP fired earlier today — blocking new opens")
+            return
+        if getattr(self, "_daily_loss_halt_on", None) == _today:
+            log.debug("Daily LOSS stop halted earlier today — blocking new opens "
+                      "(kept winners ride their own stops)")
             return
 
         # Step 4: gather candidates
@@ -3030,12 +3048,35 @@ class LiveTrader:
             return None
 
     def _daily_loss_stop_if_due(self, account, positions) -> bool:
-        """Hard intraday loss kill-switch (the loss-side mirror of the daily
-        profit-take). The risk gate's daily_loss_cap only BLOCKS NEW trades and
-        counts REALIZED P&L only — so a deeply underwater book can blow far past
-        the cap before EOD flatten (2026-05-29: -$1,953 ≈ 4x the $500 cap). This
-        flattens everything + halts the day the moment intraday P&L (realized +
-        unrealized = equity - last_equity) breaches the cap.
+        """SELECTIVE intraday loss de-risk (the loss-side mirror of the daily
+        profit-take, but surgical). The risk gate's daily_loss_cap only BLOCKS
+        NEW trades and counts REALIZED P&L only — so a deeply underwater book can
+        blow far past the cap before EOD flatten (2026-05-29: -$1,953 ≈ 4x the
+        $500 cap). When intraday P&L (realized + unrealized = equity -
+        last_equity) breaches the cap, this:
+
+          1. Closes ONLY the LOSING positions (unrealized_pl < 0). WINNERS
+             (unrealized_pl >= 0) are KEPT — they ride their own per-position
+             stops (stock brackets, option TP/SL, crypto trail), which run
+             elsewhere. (Old behaviour flattened EVERYTHING, e.g. cutting
+             winning stocks +$82 alongside losing options −$270 → realized −$370
+             instead of ~−$270.)
+          2. HALTS new entries for the rest of the day via ``_daily_loss_halt_on``
+             (a SEPARATE flag from the profit-take's ``_daily_tp_fired_on`` —
+             see below).
+          3. ROLLING: on EVERY subsequent iteration while halted, re-closes any
+             position that has SINCE gone unrealized_pl < 0 (a kept winner that
+             reverses gets cut next tick). Greens are kept only while green.
+
+        FLAG SEPARATION (critical): this sets ``_daily_loss_halt_on``, NOT
+        ``_daily_tp_fired_on``. ``_daily_profit_take_if_due`` has a retry branch
+        ``if _daily_tp_fired_on == today and positions: _fire_daily_flatten(ALL)``
+        — if the loss-stop set that flag, the profit-take retry would flatten the
+        KEPT WINNERS and defeat this feature. So we keep ``_daily_tp_fired_on``
+        untouched and pass ``set_halt_flag=False`` to ``_fire_daily_flatten`` (so
+        it closes only what we hand it and doesn't set the TP flag). The
+        profit-take path is unchanged: it still flattens EVERYTHING and sets its
+        own flag.
 
         ONLY active during the equities session. Alpaca's `last_equity` is the
         PRIOR equities close, so `equity - last_equity` overnight/over a weekend
@@ -3044,7 +3085,9 @@ class LiveTrader:
         at an illiquid off-hours mark on benign noise. Crypto is protected by its
         own per-position SL/TP/trailing exits while the market is closed.
 
-        Returns True if we just fired (caller should skip the rest of the loop)."""
+        Returns True if we closed something this tick (caller skips the rest of
+        the loop); False otherwise (loop continues — note new entries are still
+        blocked downstream by the ``_daily_loss_halt_on`` guard)."""
         from datetime import date as _date
         from ..config import CONFIG
         cap = abs(float(CONFIG.risk_daily_loss_cap_usd or 0))
@@ -3058,25 +3101,67 @@ class LiveTrader:
         except Exception:  # noqa: BLE001
             return False
         today = _date.today()
-        # Already halted today — let the profit-take retry path own leftover
-        # positions; don't run a second competing flatten here.
+        # If the full profit-take flatten has already fired today, it owns the
+        # book (flattens EVERYTHING + retries). Don't run a competing close.
         if getattr(self, "_daily_tp_fired_on", None) == today:
             return False
-        intraday = float(account.equity - account.last_equity)
-        if intraday <= -cap:
-            log.error(
-                "🛑 DAILY LOSS STOP: intraday $%.2f <= -$%.2f — flattening + halting for the day",
-                intraday, cap,
-            )
-            try:
-                self._maybe_alert_halt(
-                    "daily_loss_cap",
-                    f"intraday P&L ${intraday:.0f} <= -${cap:.0f} — flattened + halted",
+
+        try:
+            intraday = float(account.equity - account.last_equity)
+            already_halted = getattr(self, "_daily_loss_halt_on", None) == today
+
+            # Trigger condition: either we just breached the cap, OR we're
+            # already in the halted state (rolling re-check of kept winners).
+            if intraday > -cap and not already_halted:
+                return False
+
+            # Always recompute the CURRENT losers from the live snapshot so a
+            # winner that reversed since last tick gets cut now, and a position
+            # that recovered to >=0 is left to ride its own stop.
+            losers = [p for p in positions if float(p.unrealized_pl) < 0]
+
+            if not already_halted:
+                # FIRST trigger this day: arm the halt + alert once.
+                self._daily_loss_halt_on = today
+                log.error(
+                    "🛑 DAILY LOSS STOP: intraday $%.2f <= -$%.2f — SELECTIVE "
+                    "de-risk: cutting %d loser(s), keeping %d winner(s) on their "
+                    "own stops, halting new entries for the day.",
+                    intraday, cap, len(losers), len(positions) - len(losers),
                 )
-            except Exception:  # noqa: BLE001
-                pass
-            return self._fire_daily_flatten(positions, intraday, f"loss_stop_${intraday:.0f}")
-        return False
+                try:
+                    self._maybe_alert_halt(
+                        "daily_loss_cap",
+                        f"intraday P&L ${intraday:.0f} <= -${cap:.0f} — cut "
+                        f"{len(losers)} loser(s), kept "
+                        f"{len(positions) - len(losers)} winner(s), halted new entries",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            if not losers:
+                # Halted, but nothing currently red — keep all winners, just
+                # hold the halt. (Returns False so the loop continues; the
+                # _daily_loss_halt_on guard downstream blocks any new entry.)
+                if already_halted:
+                    log.info("🛑 LOSS HALT active: intraday $%.2f, 0 losers — "
+                             "keeping %d winner(s), no close this tick.",
+                             intraday, len(positions))
+                return False
+
+            log.warning(
+                "🛑 LOSS-STOP de-risk: closing %d loser(s) "
+                "(total u_pnl $%.2f), keeping %d winner(s).",
+                len(losers), sum(float(p.unrealized_pl) for p in losers),
+                len(positions) - len(losers),
+            )
+            return self._fire_daily_flatten(
+                losers, intraday, f"loss_stop_${intraday:.0f}",
+                set_halt_flag=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — never crash the trade loop
+            log.exception("Selective loss-stop failed (fail-safe, continuing): %s", exc)
+            return False
 
     def _daily_profit_take_if_due(self, account, positions) -> bool:
         """Two modes (both check intraday = realized + unrealized P&L):
@@ -3150,12 +3235,23 @@ class LiveTrader:
                     )
         return False
 
-    def _fire_daily_flatten(self, positions, intraday_pnl: float, mode: str) -> bool:
-        """Flatten all positions + halt for day.
+    def _fire_daily_flatten(self, positions, intraday_pnl: float, mode: str,
+                            set_halt_flag: bool = True) -> bool:
+        """Flatten the given positions + (optionally) halt for the day.
 
         VERIFICATION: re-fetches positions after close attempts, logs anything
         that didn't actually close. The 'fired' flag is set immediately to block
         new opens, but if any position remains we retry on subsequent iterations.
+
+        ``set_halt_flag`` (default True — profit-take behaviour is UNCHANGED):
+        when True, sets ``_daily_tp_fired_on``+persists, so the profit-take retry
+        branch owns leftover positions and new opens are blocked. The SELECTIVE
+        loss-stop passes ``set_halt_flag=False`` and ONLY its losing positions,
+        so it must NOT set ``_daily_tp_fired_on`` — otherwise the profit-take
+        retry (``if _daily_tp_fired_on == today and positions: flatten ALL``)
+        would grab the KEPT WINNERS and defeat the selective de-risk. The
+        loss-stop sets its own ``_daily_loss_halt_on`` flag for the new-entry
+        halt; per-position closes are re-driven each tick by the loss-stop itself.
 
         Per-asset close strategy:
         - Stocks: close_position (Alpaca handles via market sell)
@@ -3165,18 +3261,45 @@ class LiveTrader:
         from datetime import date as _date
         import time as _time
         log.warning(
-            "🎯 DAILY TP FIRED [%s]: intraday $%.2f. Flattening %d positions + halting for day.",
+            "🎯 DAILY %s [%s]: intraday $%.2f. Closing %d positions%s.",
+            "TP FIRED" if intraday_pnl >= 0 else "LOSS STOP",
             mode, intraday_pnl, len(positions),
+            " + halting for day" if set_halt_flag else " (selective de-risk)",
         )
-        self._daily_tp_fired_on = _date.today()  # set IMMEDIATELY so new opens are blocked
-        self._persist_daily_tp_state()  # persist to DB so restarts respect it
+        if set_halt_flag:
+            self._daily_tp_fired_on = _date.today()  # set IMMEDIATELY so new opens are blocked
+            self._persist_daily_tp_state()  # persist to DB so restarts respect it
 
-        # 1. Cancel all open orders FIRST (frees bracket-child qty)
+        # 1. Cancel open orders FIRST (frees bracket-child qty so the close
+        # market order isn't rejected for held qty).
+        #   - Full flatten (set_halt_flag=True): cancel EVERYTHING.
+        #   - Selective de-risk (set_halt_flag=False): cancel ONLY the orders
+        #     tied to the positions we're closing. A blanket cancel here would
+        #     strip the protective bracket (SL/TP) off the KEPT WINNERS, leaving
+        #     them naked — the exact opposite of "keep the winners on their own
+        #     stops". Match by symbol incl. bracket child legs.
         try:
-            n = self.alpaca.cancel_all_orders()
-            log.info("  cancelled %d open orders", n or 0)
+            if set_halt_flag:
+                n = self.alpaca.cancel_all_orders()
+                log.info("  cancelled %d open orders", n or 0)
+            else:
+                close_syms = {p.symbol for p in positions}
+                cancelled = 0
+                for o in self.alpaca.list_orders(status="open", limit=200):
+                    o_syms = {o.symbol} | {
+                        (leg or {}).get("symbol") for leg in (o.legs or [])
+                    }
+                    if close_syms & o_syms:
+                        try:
+                            self.alpaca.cancel_order(o.id)
+                            cancelled += 1
+                        except AlpacaError as exc:
+                            log.warning("  cancel_order(%s) failed: %s", o.id, exc)
+                log.info("  selectively cancelled %d order(s) for %d closing "
+                         "position(s); kept winners' brackets intact",
+                         cancelled, len(close_syms))
         except AlpacaError as exc:
-            log.warning("  cancel_all_orders failed: %s", exc)
+            log.warning("  order cancel step failed: %s", exc)
         _time.sleep(2)
 
         # 2. Close each position with the right method per asset class
@@ -3222,15 +3345,25 @@ class LiveTrader:
         except AlpacaError:
             remaining = positions  # assume worst, retry next iteration
 
-        if remaining:
+        # In selective mode `remaining` is the WHOLE account (kept winners +
+        # any loser that didn't close). Only the targeted symbols that are
+        # still present are real failures-to-close; the rest are kept winners.
+        if set_halt_flag:
+            still_open = remaining
+        else:
+            target_syms = {p.symbol for p in positions}
+            still_open = [p for p in remaining if p.symbol in target_syms]
+
+        _label = "TP" if intraday_pnl >= 0 else "LOSS STOP"
+        if still_open:
             log.warning(
-                "🎯 DAILY TP partial flatten: %d/%d closed, %d STILL OPEN — will retry next iteration",
-                succeeded, attempted, len(remaining),
+                "🎯 DAILY %s partial flatten: %d/%d closed, %d STILL OPEN — will retry next iteration",
+                _label, succeeded, attempted, len(still_open),
             )
-            for p in remaining:
+            for p in still_open:
                 log.warning("    still open: %s qty=%g", p.symbol, p.qty)
         else:
-            log.warning("🎯 DAILY TP CONFIRMED FLATTEN: 0 positions remain")
+            log.warning("🎯 DAILY %s CONFIRMED FLATTEN: 0 targeted positions remain", _label)
 
         # Book realized P&L for actually-closed positions.
         # NOTE: option legs (OCC symbols, len>15) are NOT booked here —
@@ -3273,7 +3406,13 @@ class LiveTrader:
         # Telegram alert — ONLY on first fire of the day, NOT on retries.
         # Retries spam the user with identical messages. P&L-sign-aware so a
         # loss-stop fire (intraday_pnl < 0) reads as a loss halt, not a "TP hit".
-        if mode != "retry" and not getattr(self, "_daily_tp_notified", False):
+        # Selective de-risk (set_halt_flag=False) is NOT alerted here — the
+        # loss-stop's own _maybe_alert_halt("daily_loss_cap", …) owns that
+        # message (once/day), and `remaining` here includes the KEPT WINNERS so
+        # a "(N retrying)" note would be misleading. Also: it fires every tick a
+        # kept winner reverses, which would spam.
+        if (set_halt_flag and mode != "retry"
+                and not getattr(self, "_daily_tp_notified", False)):
             self._daily_tp_notified = True
             try:
                 from ..notifications.realtime import TradeAlert, notify_trade

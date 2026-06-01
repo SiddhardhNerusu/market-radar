@@ -11,7 +11,9 @@ Rules left untouched (still evaluated from CONFIG):
   1. emergency_stop
   3. drift_block
   4. min_calibrated_p
-  5. max_daily_trades (we still use Alpaca order count below)
+  5. max_daily_trades        -> DB: today's 'placed' entries (bot_decisions
+     + bot_option_decisions). NOT Alpaca order count — that over-counted
+     bracket TP/SL legs + crypto exits + cancels and starved the bot.
 
 Rules overridden:
   2. daily_loss_cap          -> Alpaca: equity - last_equity
@@ -81,19 +83,31 @@ class LiveRiskManager(RiskManager):
         return float(a.equity - a.last_equity)
 
     def _today_trade_count(self) -> int:
-        """Count today's submitted orders via Alpaca."""
+        """Count today's NEW ENTRIES from the DB — NOT raw Alpaca orders.
+
+        The previous Alpaca ``list_orders(status='all')`` count was badly
+        inflated: every stock entry is submitted as a 3-row BRACKET (parent
+        buy + TP leg + SL leg), and the count also included crypto EXIT orders
+        and CANCELED orders. So ~3 real entries showed as ~18 orders, and the
+        max_daily_trades rule fired at ~4 real trades instead of 15 — silently
+        starving the bot (2026-06-01: 135 candidates wrongly blocked all day).
+
+        The base method counts ``bot_decisions`` 'placed' (one row per real
+        stock/crypto entry); we add option entries from ``bot_option_decisions``
+        (a separate table). Falls back to the base count if the options query
+        fails, and the base method itself fails closed on error."""
+        n = super()._today_trade_count()  # bot_decisions: stock/crypto entries
         try:
-            since = datetime.utcnow().replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).isoformat() + "Z"
-            orders = self._alpaca.list_orders(
-                status="all", limit=500, after=since, nested=False
-            )
-        except AlpacaError as exc:
-            log.warning("list_orders today failed: %s — failing closed", exc)
-            # Returning a huge number guarantees the daily-trades rule blocks.
-            return 10_000
-        return len(orders)
+            from ..storage import get_connection
+            with get_connection() as conn:
+                n += int(conn.execute(
+                    "SELECT COUNT(*) FROM bot_option_decisions "
+                    "WHERE outcome='placed' "
+                    "AND decided_at >= datetime('now','start of day')"
+                ).fetchone()[0])
+        except Exception as exc:  # noqa: BLE001 — options table optional
+            log.debug("option entry count failed (using base only): %s", exc)
+        return n
 
     def _latest_account_equity(self) -> Optional[float]:
         if not self._refresh_if_stale() or self._cached_account is None:

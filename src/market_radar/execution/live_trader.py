@@ -1161,10 +1161,14 @@ class LiveTrader:
         # extreme-p requirement because the ML model has never seen this
         # event_type during training and would produce garbage predictions.
         # The signal itself IS the edge; we just need composite + sentiment.
+        # High-conviction only: the 2026-05-28 winning day's price-action
+        # trades were composite 6.5-8.5 with |sentiment| 0.6. Raised the
+        # sentiment floor 0.3 -> 0.5 so only strong-conviction breakouts fire
+        # (user: "rather 3 high-conviction trades than a million weak ones").
         pa_bypass_clause = (
             "OR (rs.source LIKE 'price_action_%' "
             "    AND ss.composite_score >= 6.5 "
-            "    AND ABS(COALESCE(ss.sentiment, 0)) >= 0.3)"
+            "    AND ABS(COALESCE(ss.sentiment, 0)) >= 0.5)"
         )
         # News-quality bypass — high-confidence event types with strong
         # sentiment and factual=1 can fire even without extreme model_p.

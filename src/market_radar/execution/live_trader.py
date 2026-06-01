@@ -1943,20 +1943,24 @@ class LiveTrader:
                     )
                     return
 
-        # DOUBLE-OPEN GUARD: crypto market orders may take 5-30s to show up
-        # in get_positions(). If the bot iterates faster than fill propagation,
-        # it sees "no position" and submits AGAIN for the same ticker.
-        # Track recent submits in-memory; reject if <90s since last submit
-        # for this ticker.
+        # DOUBLE-OPEN / SAME-TICKER RE-ENTRY GUARD: an order can take time to
+        # FILL and show up in get_positions(). The per-ticker cap reads filled
+        # positions, so until a submit fills it's invisible to the cap — and a
+        # second order on the same name slips through, stacking past the cap
+        # (observed 2026-06-01: MARA bought twice 3min apart = $743 ≈ 2x the 6%
+        # cap, because the 90s window expired before the first fill propagated).
+        # Widened to 300s so the prior fill is reflected in the snapshot before
+        # the same ticker can be re-entered, after which the per-ticker cap
+        # correctly blocks further adds.
         import time as _t
         if not hasattr(self, "_recent_submits"):
             self._recent_submits = {}
         sym_upper = symbol.upper()
         last_submit = self._recent_submits.get(sym_upper, 0)
         now_ts = _t.time()
-        if now_ts - last_submit < 90:
+        if now_ts - last_submit < 300:
             log.warning(
-                "[%s] DOUBLE-OPEN GUARD: %.0fs since last submit (<90s) — skipping",
+                "[%s] RE-ENTRY GUARD: %.0fs since last submit (<300s) — skipping",
                 symbol, now_ts - last_submit,
             )
             self._persist_decision(

@@ -3250,10 +3250,15 @@ class LiveTrader:
                 pnl = float(p.unrealized_pl)
                 total_realized += pnl
                 with get_connection() as conn:
+                    # Label the exit by what ACTUALLY happened, not always
+                    # 'daily_profit_take'. A loss-stop flatten labeled as a
+                    # profit-take corrupts the learning/audit data (can't tell a
+                    # capped-loss day from a locked-profit day).
+                    _flat_reason = "daily_loss_stop" if intraday_pnl < 0 else "daily_profit_take"
                     conn.execute(
-                        "UPDATE bot_orders SET realized_pnl_usd=?, exit_reason='daily_profit_take', "
+                        "UPDATE bot_orders SET realized_pnl_usd=?, exit_reason=?, "
                         "canceled_at=? WHERE ticker=? AND status='filled' AND realized_pnl_usd IS NULL",
-                        (pnl, utc_now(), p.symbol),
+                        (pnl, _flat_reason, utc_now(), p.symbol),
                     )
                     self._update_daily_pnl(conn, pnl)
 

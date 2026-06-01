@@ -744,6 +744,17 @@ class LiveTrader:
         except Exception as exc:  # noqa: BLE001
             log.exception("Option spread reconcile failed: %s", exc)
 
+        # Step 2-ter: backfill realized P&L for any CLOSED option spread that
+        # never got it booked — primarily spreads flattened by the daily
+        # loss-stop (_fire_daily_flatten closes legs but historically never
+        # touched bot_option_spreads, leaving realized_pnl_usd NULL → the
+        # learning loop is blind to those outcomes). Reads the REAL close
+        # fills from Alpaca (idempotent; guarded on realized_pnl_usd IS NULL).
+        try:
+            self._reconcile_option_spread_pnl()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Option spread P&L reconcile failed: %s", exc)
+
         # Step 2a: reconcile bot's realized P&L against Alpaca truth.
         # Manual closes / cleanup scripts / EOD orders that the poller missed
         # all get retroactively booked here so the dashboard matches reality.
@@ -2473,6 +2484,301 @@ class LiveTrader:
             except AlpacaError as exc:
                 log.error("CRYPTO FLIP close failed for %s: %s", slashed, exc)
 
+    # ------------------------------------------------------------------
+    # Option-spread realized P&L from REAL close fills
+    # ------------------------------------------------------------------
+    def _exit_credit_from_close_fills(
+        self,
+        *,
+        spread_id: int,
+        legs: list[dict],
+        contracts: int,
+        close_order_ids: Optional[list[str]] = None,
+    ) -> Optional[float]:
+        """Compute the net exit CREDIT (per spread) from the spread's REAL
+        closing fills at Alpaca — never from intraday quotes.
+
+        Quotes on these names are illiquid/wide and swing wildly (a quote
+        mark moved -$422 → -$843 in minutes on 2026-06-01). The reliable
+        number is the actual fill. Two resolution strategies, in order:
+
+        1. **By the close order(s) we submitted.** Pass ``close_order_ids``
+           (Alpaca order ids). For a multi-leg ('mleg') close, the parent
+           ``filled_avg_price`` is the SIGNED net (negative = credit
+           received to close); we return ``abs(filled_avg_price)``. We also
+           verify against the per-leg fills (sum(sell fills) − sum(buy
+           fills)). For per-leg simple orders (the daily-flatten path) we
+           sum each order's signed fill.
+
+        2. **By leg symbol + FIFO allocation** (fallback / reconcile). Pull
+           FILL account activities, keep only CLOSE-side fills for each leg
+           (opposite the entry side), and allocate ``contracts`` worth to
+           this spread FIFO. Handles spreads that share identical legs
+           (e.g. two INTC spreads on the same strikes) by consuming a
+           shared per-call pool.
+
+        Returns the per-spread net credit (long-leg sell px − short-leg buy
+        px), or ``None`` if fills can't be resolved. Read-only on Alpaca.
+        """
+        long_leg = next((L for L in legs if L["role"] == "long"), None)
+        short_leg = next((L for L in legs if L["role"] == "short"), None)
+        if long_leg is None or short_leg is None or contracts <= 0:
+            return None
+
+        # --- Strategy 1: from the specific close order(s) we submitted -----
+        if close_order_ids:
+            try:
+                long_px = short_px = None
+                # If a single mleg order closed both legs, the parent's
+                # signed net is authoritative; cross-check via legs.
+                for oid in close_order_ids:
+                    o = self.alpaca.get_order(oid)
+                    if (o.status or "").lower() != "filled":
+                        return None  # not done filling yet — caller retries later
+                    o_legs = o.legs or []
+                    if o_legs:
+                        # multi-leg close: derive per-leg fills
+                        for L in o_legs:
+                            fp = L.get("filled_avg_price")
+                            if fp is None:
+                                return None
+                            fp = float(fp)
+                            if L.get("symbol") == long_leg["contract_symbol"]:
+                                long_px = fp
+                            elif L.get("symbol") == short_leg["contract_symbol"]:
+                                short_px = fp
+                    else:
+                        # per-leg simple order (daily-flatten path)
+                        fp = o.filled_avg_price
+                        if fp is None:
+                            return None
+                        fp = float(fp)
+                        if o.symbol == long_leg["contract_symbol"]:
+                            long_px = fp
+                        elif o.symbol == short_leg["contract_symbol"]:
+                            short_px = fp
+                if long_px is not None and short_px is not None:
+                    return long_px - short_px
+            except AlpacaError as exc:
+                log.debug("exit-credit by order-id failed for spread %d: %s",
+                          spread_id, exc)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("exit-credit by order-id error for spread %d: %s",
+                          spread_id, exc)
+
+        # --- Strategy 2: leg-symbol FIFO over FILL activities --------------
+        try:
+            pool = self._closing_fill_pool()
+        except Exception as exc:  # noqa: BLE001
+            log.debug("could not build closing-fill pool: %s", exc)
+            return None
+
+        def _close_side(entry_side: str) -> str:
+            return "sell" if entry_side == "buy" else "buy"
+
+        def _take(symbol: str, side: str, need: int) -> Optional[float]:
+            fills = pool.get((symbol, side), [])
+            got = 0.0
+            cost = 0.0
+            for f in fills:
+                if got >= need:
+                    break
+                take_q = min(f["qty_left"], need - got)
+                if take_q <= 0:
+                    continue
+                cost += take_q * f["price"]
+                got += take_q
+                f["qty_left"] -= take_q
+            if got < need - 1e-6:
+                return None
+            return cost / got if got > 0 else None
+
+        long_px = _take(long_leg["contract_symbol"],
+                        _close_side(long_leg["side"]), contracts)
+        short_px = _take(short_leg["contract_symbol"],
+                         _close_side(short_leg["side"]), contracts)
+        if long_px is None or short_px is None:
+            return None
+        return long_px - short_px
+
+    def _closing_fill_pool(self) -> dict:
+        """Build a FIFO-consumable pool of option CLOSE fills, keyed by
+        (contract_symbol, side). Cached per loop-iteration so multiple
+        spreads sharing legs allocate from the SAME pool (no double-count).
+
+        Only fills from recognised close orders are included
+        (``tpfire-*`` daily-flatten leg sells, ``mr-ox-*`` poll-exit mleg,
+        ``mr-eod-opt-*`` EOD mleg). Read-only on Alpaca.
+        """
+        from collections import defaultdict
+        import time as _t_pool
+        # Short-TTL cache so spreads sharing legs within the same loop burst
+        # (reconcile → poll-exit → flatten) allocate from ONE pool without
+        # double-counting, while staying fresh across 30s iterations.
+        now = _t_pool.monotonic()
+        cache = getattr(self, "_closing_fill_pool_cache", None)
+        if cache is not None and (now - cache[0]) < 10.0:
+            return cache[1]
+
+        acts = self.alpaca.list_account_activities(activity_type="FILL",
+                                                   page_size=100) or []
+        orders = self.alpaca.list_orders(status="all", limit=500, nested=True)
+        coid_by_oid = {o.id: (o.client_order_id or "") for o in orders}
+
+        pool: dict = defaultdict(list)
+        for a in acts:
+            sym = a.get("symbol", "") or ""
+            if len(sym) <= 15:  # OCC option symbols only
+                continue
+            coid = coid_by_oid.get(a.get("order_id", ""), "")
+            if not coid.startswith(("tpfire-", "mr-ox-", "mr-eod-opt-")):
+                continue
+            raw_side = a.get("side", "") or ""
+            side = "sell" if raw_side.startswith("sell") else "buy"
+            try:
+                qty = abs(float(a.get("qty", 0) or 0))
+                price = float(a.get("price", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0 or price <= 0:
+                continue
+            pool[(sym, side)].append(
+                {"qty_left": qty, "price": price,
+                 "tt": a.get("transaction_time", "")})
+        # Stable FIFO order by fill time
+        for k in pool:
+            pool[k].sort(key=lambda f: f["tt"])
+        self._closing_fill_pool_cache = (now, pool)
+        return pool
+
+    def _book_spread_exit(
+        self,
+        *,
+        spread_id: int,
+        underlying: str,
+        entry_debit: float,
+        contracts: int,
+        legs: list[dict],
+        exit_reason: str,
+        close_order_ids: Optional[list[str]] = None,
+        set_closed_at: bool = True,
+    ) -> Optional[float]:
+        """Idempotently book realized P&L for one option spread from its
+        REAL close fills, and update daily P&L.
+
+        Guards on ``realized_pnl_usd IS NULL`` so it can never double-book
+        (safe to call from multiple paths + the reconcile backstop). Never
+        places orders. Returns the booked realized P&L, or ``None`` if it
+        couldn't resolve fills (left for a later pass to retry).
+        """
+        try:
+            exit_credit = self._exit_credit_from_close_fills(
+                spread_id=spread_id, legs=legs, contracts=contracts,
+                close_order_ids=close_order_ids,
+            )
+            if exit_credit is None:
+                log.debug("spread %d (%s): close fills not resolvable yet — "
+                          "deferring realized P&L booking",
+                          spread_id, underlying)
+                return None
+            realized = (exit_credit - entry_debit) * contracts * 100
+            pnl_pct = ((exit_credit - entry_debit) / entry_debit * 100
+                       if entry_debit else 0.0)
+            with get_connection() as conn:
+                # Idempotent: only book if not already booked.
+                cur = conn.execute(
+                    "UPDATE bot_option_spreads "
+                    "SET exit_credit_usd=?, realized_pnl_usd=?, pnl_pct=?, "
+                    "    exit_reason=COALESCE(exit_reason, ?), "
+                    "    closed_at=COALESCE(closed_at, ?) "
+                    "WHERE id=? AND realized_pnl_usd IS NULL",
+                    (exit_credit, realized, pnl_pct, exit_reason,
+                     (utc_now() if set_closed_at else None), spread_id),
+                )
+                if cur.rowcount == 0:
+                    return None  # already booked by another path — no dup
+                # NOTE: do NOT touch bot_daily_pnl here. _reconcile_realized_pnl
+                # owns the daily total (authoritative Alpaca equity-delta, set
+                # every loop). Adding realized here would transiently double-
+                # count (could make the daily_loss_cap gate spuriously block for
+                # one iteration). This booking's job is only the per-spread
+                # realized_pnl_usd that the learning loop reads.
+            log.info(
+                "OPT P&L booked [%s] spread %d %s: entry=$%.2f exit=$%.2f "
+                "× %d → realized $%+.2f (%.1f%%)",
+                exit_reason, spread_id, underlying, entry_debit, exit_credit,
+                contracts, realized, pnl_pct,
+            )
+            return realized
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not book spread %d (%s) realized P&L: %s",
+                        spread_id, underlying, exc)
+            return None
+
+    def _reconcile_option_spread_pnl(self) -> None:
+        """Backstop: book realized P&L for any spread that has been CLOSED
+        (closed_at set, or legs gone from Alpaca) but whose
+        ``realized_pnl_usd`` is still NULL.
+
+        This catches spreads flattened by the daily loss-stop
+        (``_fire_daily_flatten`` sells legs but historically never touched
+        ``bot_option_spreads``) and any spread closed by older code paths.
+        Idempotent (``_book_spread_exit`` guards on NULL) and fully
+        fail-safe. Read-only on Alpaca.
+        """
+        try:
+            with get_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, underlying, entry_debit_usd, contracts,
+                           closed_at, status
+                    FROM bot_option_spreads
+                    WHERE status='filled'
+                      AND realized_pnl_usd IS NULL
+                      AND entry_debit_usd IS NOT NULL
+                      AND contracts > 0
+                    """
+                ).fetchall()
+                if not rows:
+                    return
+                legs_by_spread: dict[int, list[dict]] = {}
+                for r in rows:
+                    legs = conn.execute(
+                        "SELECT contract_symbol, role, side "
+                        "FROM bot_option_legs WHERE spread_id=?",
+                        (r["id"],),
+                    ).fetchall()
+                    legs_by_spread[r["id"]] = [dict(L) for L in legs]
+
+            # Which option contracts are still open at Alpaca? A spread whose
+            # legs are gone has been closed even if closed_at wasn't set.
+            try:
+                positions = self.alpaca.get_positions()
+                open_occ = {p.symbol for p in positions if len(p.symbol) > 15}
+            except AlpacaError:
+                open_occ = None  # unknown — only process rows with closed_at
+
+            for r in rows:
+                sp = dict(r)
+                legs = legs_by_spread.get(sp["id"], [])
+                if not legs:
+                    continue
+                legs_open = (open_occ is not None
+                             and any(L["contract_symbol"] in open_occ
+                                     for L in legs))
+                # Skip spreads still open (no closed_at and legs still held).
+                if sp["closed_at"] is None and (legs_open or open_occ is None):
+                    continue
+                self._book_spread_exit(
+                    spread_id=sp["id"], underlying=sp["underlying"],
+                    entry_debit=float(sp["entry_debit_usd"]),
+                    contracts=int(sp["contracts"]), legs=legs,
+                    exit_reason="reconciled_close_fill",
+                    set_closed_at=(sp["closed_at"] is None),
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("_reconcile_option_spread_pnl failed: %s", exc)
+
     def _poll_option_exits(self) -> None:
         if self.options is None:
             return
@@ -2641,17 +2947,37 @@ class LiveTrader:
                               sp["id"], exc)
                     continue
 
-                realized = (current_debit - entry_debit) * contracts * 100
-                with get_connection() as conn:
-                    conn.execute(
-                        "UPDATE bot_option_spreads SET closed_at=?, "
-                        "exit_credit_usd=?, realized_pnl_usd=?, pnl_pct=?, exit_reason=? "
-                        "WHERE id=?",
-                        (utc_now(), current_debit, realized,
-                         pnl_pct_of_debit * 100, exit_reason, sp["id"]),
-                    )
-                    # Also book to daily P&L
-                    self._update_daily_pnl(conn, realized)
+                # Book realized P&L from the REAL close fill, not the quote
+                # mark. Option quotes on these names are illiquid/wide and
+                # swing wildly minute-to-minute; the close order's actual
+                # fill is authoritative. _book_spread_exit reads the fill
+                # (mleg parent net / leg fills) and is idempotent. If the
+                # close order hasn't filled yet (resolves None), fall back to
+                # the quote mark so we still close the row + book *something*;
+                # the reconcile backstop will correct it to the real fill
+                # next iteration (it re-books only while realized is NULL —
+                # so a quote fallback that *did* write a number is final;
+                # therefore only fall back when the row would otherwise stay
+                # open/unbooked).
+                realized = self._book_spread_exit(
+                    spread_id=sp["id"], underlying=sp["underlying"],
+                    entry_debit=entry_debit, contracts=contracts, legs=legs,
+                    exit_reason=exit_reason,
+                    close_order_ids=[mleg.id] if getattr(mleg, "id", None) else None,
+                )
+                if realized is None:
+                    # Fill not yet resolvable — defer booking. Mark closed so
+                    # the poller stops re-submitting; the reconcile backstop
+                    # books the real realized P&L once the fill lands (it acts
+                    # only while realized_pnl_usd IS NULL).
+                    realized = (current_debit - entry_debit) * contracts * 100
+                    with get_connection() as conn:
+                        conn.execute(
+                            "UPDATE bot_option_spreads SET closed_at=?, "
+                            "exit_reason=COALESCE(exit_reason, ?) "
+                            "WHERE id=? AND closed_at IS NULL",
+                            (utc_now(), exit_reason, sp["id"]),
+                        )
 
                 try:
                     from ..notifications.realtime import TradeAlert, notify_trade
@@ -2906,11 +3232,21 @@ class LiveTrader:
         else:
             log.warning("🎯 DAILY TP CONFIRMED FLATTEN: 0 positions remain")
 
-        # Book realized P&L for actually-closed positions
+        # Book realized P&L for actually-closed positions.
+        # NOTE: option legs (OCC symbols, len>15) are NOT booked here —
+        # their P&L is per-SPREAD (long+short net), not per-leg, and the
+        # leg's unrealized_pl is a mark-based number. Booking it here would
+        # both mis-record (no bot_orders row matches an OCC symbol) and
+        # double-count daily P&L against the spread-level booking below.
+        # Stocks/crypto are still booked via their unrealized_pl as before.
         closed_syms = {p.symbol for p in positions} - {p.symbol for p in remaining}
         total_realized = 0.0
+        closed_option_legs = False
         for p in positions:
             if p.symbol in closed_syms:
+                if len(p.symbol) > 15:  # option leg — handled per-spread below
+                    closed_option_legs = True
+                    continue
                 pnl = float(p.unrealized_pl)
                 total_realized += pnl
                 with get_connection() as conn:
@@ -2920,6 +3256,14 @@ class LiveTrader:
                         (pnl, utc_now(), p.symbol),
                     )
                     self._update_daily_pnl(conn, pnl)
+
+        # Book any option spreads whose legs were just flattened, from their
+        # REAL close fills (the tpfire-* leg sells land in the fill pool).
+        # _reconcile_option_spread_pnl is idempotent + fail-safe and matches
+        # spreads by closed-at / legs-gone-from-Alpaca. This is what makes
+        # the loss-stop path stop being blind to option outcomes.
+        if closed_option_legs:
+            self._reconcile_option_spread_pnl()
 
         # Telegram alert — ONLY on first fire of the day, NOT on retries.
         # Retries spam the user with identical messages. P&L-sign-aware so a
@@ -3155,17 +3499,31 @@ class LiveTrader:
                 ]
                 try:
                     import time as _t_eod_opt
-                    self.options.submit_multi_leg(
+                    mleg = self.options.submit_multi_leg(
                         legs=close_legs, qty=int(sp_d["contracts"]),
                         limit_price=None,  # market close at EOD
                         client_order_id=f"mr-eod-opt-{sp_d['id']}-{_t_eod_opt.time_ns()}",
                     )
+                    # Mark closed immediately so the poller stops; then book
+                    # realized P&L from the REAL close fill (idempotent). If
+                    # the market close hasn't filled this instant, the
+                    # reconcile backstop books it next iteration (it acts only
+                    # while realized_pnl_usd IS NULL, so no double-book).
                     with get_connection() as conn:
                         conn.execute(
                             "UPDATE bot_option_spreads SET closed_at=?, "
-                            "exit_reason='eod_flatten_day_trader' WHERE id=?",
+                            "exit_reason=COALESCE(exit_reason,'eod_flatten_day_trader') "
+                            "WHERE id=? AND closed_at IS NULL",
                             (utc_now(), sp_d["id"]),
                         )
+                    self._book_spread_exit(
+                        spread_id=sp_d["id"], underlying=sp_d["underlying"],
+                        entry_debit=float(sp_d["entry_debit_usd"]),
+                        contracts=int(sp_d["contracts"]),
+                        legs=legs, exit_reason="eod_flatten_day_trader",
+                        close_order_ids=[mleg.id] if getattr(mleg, "id", None) else None,
+                        set_closed_at=False,
+                    )
                     log.info("  EOD closed day-trader OPT spread %s (exp %s)",
                              sp_d["underlying"], sp_d["expiration_date"])
                 except AlpacaError as exc:

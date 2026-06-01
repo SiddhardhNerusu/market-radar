@@ -476,6 +476,29 @@ class AlpacaClient:
         return _to_order(self._request("GET", f"/v2/orders/{order_id}",
                                        params={"nested": "true"}))
 
+    def list_account_activities(
+        self,
+        *,
+        activity_type: Optional[str] = None,
+        page_size: int = 100,
+        after: Optional[str] = None,
+    ) -> list[dict]:
+        """Return raw account-activity records (e.g. FILL).
+
+        Used to read REAL per-leg execution prices for option-spread close
+        fills — the authoritative source for realized P&L (intraday option
+        quotes are illiquid and unreliable). Returns the raw dicts from
+        Alpaca (each FILL has symbol, side, qty, price, order_id,
+        transaction_time). ``page_size`` is capped at Alpaca's max of 100.
+        """
+        path = ("/v2/account/activities/" + activity_type
+                if activity_type else "/v2/account/activities")
+        params: dict[str, Any] = {"page_size": min(int(page_size), 100)}
+        if after:
+            params["after"] = after
+        items = self._request("GET", path, params=params)
+        return items if isinstance(items, list) else []
+
     def cancel_order(self, order_id: str) -> None:
         self._request("DELETE", f"/v2/orders/{order_id}")
 

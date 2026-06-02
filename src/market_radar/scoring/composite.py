@@ -238,6 +238,22 @@ def _score_one(
     pump_penalty = 2.0 if anti_pump_flag else 0.0
     routine_penalty = 2.0 if is_routine else 0.0
 
+    # Generic, direction-unknown insider filings (Form 4 with no clear buy
+    # signal) are credibility-high but information-poor — mostly routine sells,
+    # scheduled sales and option exercises. On SEC source-weight + corroboration
+    # alone they were scoring ~9 and flooding "strong" (e.g. dozens of C / BAC
+    # filings a day all at 9.3). The real edge is insider BUY clusters with clear
+    # bullish sentiment, not the Form-4 firehose. Penalise the low-conviction
+    # ones so "strong" stays meaningful. They already fail the |sentiment|>=0.5
+    # trade-bypass gate, so this de-noises scoring/alerts without changing what
+    # actually trades; genuine insider buys (event_type insider_buy, or an
+    # insider_transaction with |sentiment|>=0.5) are spared.
+    low_conviction_insider = (
+        event_type == "insider_transaction"
+        and abs(classification.sentiment or 0.0) < 0.5
+    )
+    insider_noise_penalty = 3.0 if low_conviction_insider else 0.0
+
     composite = (
         source_credibility
         + factual_bonus
@@ -248,6 +264,7 @@ def _score_one(
         + megacap_bonus
         - pump_penalty
         - routine_penalty
+        - insider_noise_penalty
     )
     composite = max(0.0, min(10.0, composite))
 

@@ -221,6 +221,7 @@ class ModelPredictor:
                        ss.source_weight, ss.corroboration_count,
                        ss.author_quality, ss.anti_pump_flag, ss.composite_score,
                        ss.signal_class, ss.scored_at,
+                       rs.id AS signal_id,
                        rs.source_tier, rs.published_at,
                        st.confidence AS ticker_confidence,
                        so.price_at_flag_ts

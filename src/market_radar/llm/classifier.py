@@ -294,6 +294,18 @@ def classify_pending(*, batch_size: int = 50,
                         "output_tokens": 0,
                         "cost_usd": 0.0,
                     })
+                    try:
+                        from ..scoring.composite import rescore_with_classification
+                        rescore_with_classification(
+                            conn, signal_id=r["signal_id"], ticker=r["ticker"],
+                            event_type=existing["event_type"],
+                            sentiment=existing["sentiment"],
+                            sentiment_magnitude=existing["sentiment_magnitude"],
+                            factual=existing["factual"],
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("rescore after dedup-copy failed (%s/%s): %s",
+                                    r["signal_id"], r["ticker"], exc)
                     stats.skipped_already_done += 1
                     seen_hashes.add(chash)
                     continue
@@ -318,6 +330,20 @@ def classify_pending(*, batch_size: int = 50,
 
             classifier.store(conn, signal_id=r["signal_id"],
                              ticker=r["ticker"], result=result)
+            # Bridge the LLM label into the trade gate (recompute composite
+            # from the corrected event_type/sentiment + write to signal_scores).
+            try:
+                from ..scoring.composite import rescore_with_classification
+                rescore_with_classification(
+                    conn, signal_id=r["signal_id"], ticker=r["ticker"],
+                    event_type=result.get("event_type"),
+                    sentiment=result.get("sentiment"),
+                    sentiment_magnitude=result.get("sentiment_magnitude"),
+                    factual=result.get("factual"),
+                )
+            except Exception as exc:  # noqa: BLE001 — rescore must not break classify
+                log.warning("rescore after LLM classify failed (%s/%s): %s",
+                            r["signal_id"], r["ticker"], exc)
             stats.classified += 1
             stats.total_cost_usd += result.get("cost_usd") or 0
 

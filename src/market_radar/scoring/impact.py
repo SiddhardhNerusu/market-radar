@@ -25,6 +25,8 @@ EVENT_IMPACT: dict[str, float] = {
     "guidance_cut":       2.5,
     "macro":              2.8,
     "activist_position":  2.4,
+    "clinical_trial_result": 3.0,   # binary biotech catalyst — large moves
+    "short_seller_report": 2.4,     # activist short report — sharp downside
 
     # Medium impact — usually 1–5% moves
     "analyst_upgrade":    1.8,
@@ -36,6 +38,7 @@ EVENT_IMPACT: dict[str, float] = {
     "dividend":           1.3,
     "leadership_change":  1.8,
     "lawsuit":            1.6,
+    "contract_award":     1.9,      # major contract / deal win
 
     # Lower impact — usually <1% moves
     "ipo_registration":   1.2,
@@ -75,6 +78,9 @@ EVENT_BIAS: dict[str, Optional[Literal["long", "short", "neutral"]]] = {
     "dividend":           "long",
     "leadership_change":  None,
     "lawsuit":            "short",
+    "clinical_trial_result": None,    # depends on met vs missed endpoint
+    "short_seller_report": "short",
+    "contract_award":     "long",
     "ipo_registration":   "neutral",
     "ipo_registration_amend": "neutral",
     "material_event":     None,

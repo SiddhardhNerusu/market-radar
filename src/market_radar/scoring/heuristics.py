@@ -31,7 +31,9 @@ EVENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"acquires|to buy|will buy|merges? with|merger with|"
         r"merger of equals|definitive agreement to acquire|"
         r"all-cash deal|cash and stock|stock-for-stock|going private|"
-        r"take[- ]?private|leveraged buyout|LBO)\b",
+        r"take[- ]?private|leveraged buyout|LBO|"
+        r"combine[sd]? with|completes (?:the )?acquisition|"
+        r"deal (?:closed|completed)|to merge|merger agreement)\b",
     ]),
     ("m_a_rumor", [
         r"\b(?:in talks to acquire|in talks to buy|considering acquisition|"
@@ -49,9 +51,13 @@ EVENT_PATTERNS: list[tuple[str, list[str]]] = [
     ]),
     ("guidance_raise", [
         r"\b(?:raises|hikes|boost(?:s|ed)|lifts) (?:full[- ]year |FY |its |the )?(?:outlook|guidance|forecast)\b",
+        r"\bsees .{0,20}\babove\b",
+        r"\bups .{0,15}(?:outlook|guidance|forecast|target)\b",
+        r"\braises target\b",
     ]),
     ("guidance_cut", [
         r"\b(?:cuts|lowers|trims|reduces|slashes) (?:full[- ]year |FY |its |the )?(?:outlook|guidance|forecast)\b",
+        r"\bsees .{0,20}\bbelow\b",
     ]),
     ("fda_approval", [
         r"\b(?:FDA approves|FDA approval|approved by the FDA|granted (?:FDA )?approval|"
@@ -60,6 +66,10 @@ EVENT_PATTERNS: list[tuple[str, list[str]]] = [
     ("fda_rejection", [
         r"\b(?:FDA rejects|FDA rejection|rejected by the FDA|complete response letter|"
         r"CRL from FDA|FDA declines|FDA denies)\b",
+    ]),
+    ("clinical_trial_result", [
+        r"\b(?:Phase 3|Phase 2|Phase III|Phase II|clinical trial|primary endpoint|"
+        r"topline|met its (?:primary )?endpoint|missed its (?:primary )?endpoint)\b",
     ]),
     ("analyst_upgrade", [
         r"\b(?:upgraded? to (?:buy|outperform|overweight)|raised price target|"
@@ -89,6 +99,9 @@ EVENT_PATTERNS: list[tuple[str, list[str]]] = [
         r"\b(?:CPI|inflation|Fed (?:rate|hike|cut|decision)|FOMC|jobs report|"
         r"nonfarm payrolls|GDP|PMI|ISM)\b",
     ]),
+    ("short_seller_report", [
+        r"\b(?:short[- ]seller|Hindenburg|Muddy Waters|alleges fraud|short report)\b",
+    ]),
     ("lawsuit", [
         r"\b(?:lawsuit|sued|class[- ]action|investigation|subpoena|SEC charges|"
         r"DOJ probe|antitrust)\b",
@@ -100,6 +113,10 @@ EVENT_PATTERNS: list[tuple[str, list[str]]] = [
     ("buyback", [
         r"\b(?:share repurchase|buyback (?:program|plan)|authoriz(?:es|ed) buyback|"
         r"announce[sd]? .{0,30} buyback)\b",
+    ]),
+    ("contract_award", [
+        r"\b(?:wins .{0,20}contract|awarded .{0,20}contract|contract worth|"
+        r"secures .{0,20}deal)\b",
     ]),
     ("dividend", [
         r"\b(?:dividend (?:increase|hike|raise|boost)|special dividend|"
@@ -123,6 +140,7 @@ BULLISH_WORDS = {
     "buy", "buys", "bullish", "upgrade", "upgrades", "upgraded", "outperform",
     "overweight", "beat", "blowout", "strong", "stronger", "bullish",
     "record", "all-time-high", "all-time high", "ath", "breakout", "moon",
+    "rockets", "skyrockets", "vaults", "pops", "explodes",
 }
 BEARISH_WORDS = {
     "misses", "missed", "tumbles", "tumbled", "plunges", "plunged", "plummets",
@@ -134,6 +152,7 @@ BEARISH_WORDS = {
     "warning", "weak", "weakness", "disappoint", "disappointing", "disappointed",
     "bankruptcy", "delisting", "fraud", "scandal", "probe", "lawsuit",
     "crash", "collapse", "tank", "tanked",
+    "craters", "sinks", "sags", "nosedives", "dives",
 }
 
 # Words signalling speculation / non-factual content
@@ -210,22 +229,76 @@ def classify_heuristic(
             if any(re.search(p, text, flags=re.IGNORECASE) for p in patterns):
                 event_type = et
                 break
-        if not event_type:
-            event_type = "other"
+
+    # Generic earnings fallback: precise patterns above win first, but a real
+    # catalyst phrased loosely (e.g. "Q3 revenue jumps to a record") still
+    # deserves an earnings label rather than falling through to "other".
+    if not event_type:
+        earnings_ctx = re.search(
+            r"\b(?:Q[1-4]|quarterly|fiscal|quarter|earnings|revenue|EPS|profit|results)\b",
+            text, flags=re.IGNORECASE,
+        )
+        if earnings_ctx:
+            bullish_move = re.search(
+                r"\b(?:jumps|surges|soars|rockets|tops|record|beats?|"
+                r"above estimates|blow past)\b",
+                text, flags=re.IGNORECASE,
+            )
+            bearish_move = re.search(
+                r"\b(?:plunges|misses|falls short|below estimates|drops|"
+                r"tumbles|sinks)\b",
+                text, flags=re.IGNORECASE,
+            )
+            if bullish_move:
+                event_type = "earnings_beat"
+            elif bearish_move:
+                event_type = "earnings_miss"
+
+    if not event_type:
+        event_type = "other"
 
     # --- sentiment direction + magnitude ---
     bull_hits = sum(1 for w in BULLISH_WORDS if re.search(rf"\b{re.escape(w)}\b", text_lower))
     bear_hits = sum(1 for w in BEARISH_WORDS if re.search(rf"\b{re.escape(w)}\b", text_lower))
+
+    # Numeric-move sentiment: a big percentage move is the single strongest
+    # directional signal in a headline (e.g. a "+47%" is far more informative
+    # than any adjective) yet was previously ignored entirely. Count any
+    # move >= 10% as a strong hit so it dominates magnitude.
+    for m in re.finditer(
+        r"(?:(?P<sign>[+-])|\b(?P<dir>up|down|soars|gains?|loses?|drops?)\s+)"
+        r"(?P<num>\d{1,3}(?:\.\d+)?)\s*%",
+        text, flags=re.IGNORECASE,
+    ):
+        try:
+            num = float(m.group("num"))
+        except (TypeError, ValueError):
+            continue
+        if num < 10:
+            continue
+        sign = m.group("sign")
+        direction = (m.group("dir") or "").lower()
+        if sign == "-" or direction in {"down", "loses", "lose", "drops", "drop"}:
+            bear_hits += 1
+        else:
+            # "+", "up", "soars", "gains", or a bare percentage default bullish
+            bull_hits += 1
+
     total = bull_hits + bear_hits
     if total == 0:
         sentiment = 0.0
         sentiment_magnitude = 0.0
     else:
         sentiment = (bull_hits - bear_hits) / total
-        # Magnitude scales with how many hits, capped at 1.0
-        sentiment_magnitude = min(total / 5.0, 1.0)
+        # Magnitude floor: a single decisive word used to map to 0.2, which the
+        # downstream gate (needs >= 0.3) discarded. Floor at 0.6 for one hit and
+        # grow from there, capped at 1.0.
+        sentiment_magnitude = min(0.4 + 0.2 * total, 1.0)
 
-    # Event-type bias for sentiment if keywords were too neutral
+    # Event-type bias for sentiment if keywords were too neutral. Only fires for
+    # events with a known directional bias; for event_type == "other" we keep
+    # the bull/bear difference computed above rather than forcing 0.0, so a
+    # directional word still produces real sentiment on a generic bucket.
     if abs(sentiment) < 0.2:
         bullish_events = {
             "earnings_beat", "guidance_raise", "fda_approval", "analyst_upgrade",

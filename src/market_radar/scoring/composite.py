@@ -159,6 +159,7 @@ def _score_one(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     corroboration_window_hours: int,
+    classification=None,
 ) -> tuple[float, dict]:
     source: str = row["source"]
     ticker: str = row["ticker"]
@@ -173,13 +174,17 @@ def _score_one(
     issuer = raw_payload.get("company_name") or row["author"]
     is_routine = is_routine_filing(form=form, issuer_name=issuer)
 
-    # Heuristic classification
-    classification = classify_heuristic(
-        title=row["title"],
-        body=row["body"],
-        sec_form_event=raw_payload.get("form_event"),
-        source=source,
-    )
+    # Classification: heuristic by default, OR a caller-supplied one. The LLM
+    # pass uses the override (via rescore_with_classification) so its corrected
+    # event_type/sentiment actually reaches the trade gate, instead of sitting
+    # in a side table the gate never reads.
+    if classification is None:
+        classification = classify_heuristic(
+            title=row["title"],
+            body=row["body"],
+            sec_form_event=raw_payload.get("form_event"),
+            source=source,
+        )
     if is_routine:
         # Override event type — we don't want "M&A" or "material event"
         # tags on routine prospectus filings.
@@ -248,11 +253,15 @@ def _score_one(
     # trade-bypass gate, so this de-noises scoring/alerts without changing what
     # actually trades; genuine insider buys (event_type insider_buy, or an
     # insider_transaction with |sentiment|>=0.5) are spared.
-    low_conviction_insider = (
-        event_type == "insider_transaction"
-        and abs(classification.sentiment or 0.0) < 0.5
-    )
-    insider_noise_penalty = 3.0 if low_conviction_insider else 0.0
+    # Generic direction-unknown Form 4 (insider_transaction) is the low-alpha
+    # firehose — routine insider trades carry ~zero documented alpha. The real
+    # edge is identified opportunistic BUYS / clusters, which classify as
+    # insider_buy (untouched here). Penalise the generic bucket regardless of
+    # its (unreliable, direction-unknown) sentiment so the C/BAC/GS firehose
+    # stays out of 'strong' and the trade gate.
+    # [P2 follow-up: routine-vs-opportunistic split + buys>>sells + clusters.]
+    low_conviction_insider = (event_type == "insider_transaction")
+    insider_noise_penalty = 3.5 if low_conviction_insider else 0.0
 
     composite = (
         source_credibility
@@ -309,6 +318,76 @@ def _score_one(
         "anti_pump_flag": anti_pump_flag or (1 if is_routine else 0),
         "signal_class": signal_class,
     }
+
+
+def rescore_with_classification(
+    conn: sqlite3.Connection,
+    *,
+    signal_id: int,
+    ticker: str,
+    event_type,
+    sentiment,
+    sentiment_magnitude,
+    factual,
+    corroboration_window_hours: int = 4,
+) -> bool:
+    """Re-score one signal with a (usually LLM-produced) classification and
+    write it back to signal_scores.
+
+    THE BRIDGE: without this, the LLM classifies into the separate
+    ``llm_classifications`` table that the trade gate never reads, so a real
+    earnings/M&A catalyst the heuristic mislabelled 'other' stays untradeable.
+    Here we recompute the composite with the corrected label (re-applying source
+    credibility, breadth, recency, megacap + penalties consistently via
+    _score_one) and overwrite the gated columns. Returns True if it updated.
+    """
+    from .heuristics import HeuristicClassification
+
+    row = conn.execute(
+        """
+        SELECT rs.id AS signal_id, rs.source AS source, rs.source_tier AS source_tier,
+               rs.title AS title, rs.body AS body, rs.author AS author,
+               rs.author_metadata AS author_metadata_json,
+               rs.raw_payload AS raw_payload_json,
+               rs.ingested_at AS ingested_at, rs.published_at AS published_at,
+               st.ticker AS ticker, st.confidence AS ticker_confidence
+        FROM raw_signals rs
+        JOIN signal_tickers st ON st.signal_id = rs.id
+        WHERE rs.id = ? AND st.ticker = ?
+        """,
+        (signal_id, ticker),
+    ).fetchone()
+    if row is None:
+        return False
+
+    sent = float(sentiment) if sentiment is not None else 0.0
+    mag = float(sentiment_magnitude) if sentiment_magnitude is not None else abs(sent)
+    fact = int(factual) if factual is not None else 1
+    cls = HeuristicClassification(
+        event_type=event_type or "other",
+        sentiment=round(sent, 3),
+        sentiment_magnitude=round(min(max(mag, 0.0), 1.0), 3),
+        factual=fact,
+    )
+
+    composite, fields = _score_one(
+        conn, row, corroboration_window_hours, classification=cls
+    )
+
+    conn.execute(
+        """
+        UPDATE signal_scores
+           SET event_type = ?, sentiment = ?, sentiment_magnitude = ?,
+               factual = ?, composite_score = ?, signal_class = ?
+         WHERE signal_id = ? AND ticker = ?
+        """,
+        (
+            fields["event_type"], fields["sentiment"], fields["sentiment_magnitude"],
+            fields["factual"], composite, fields["signal_class"],
+            signal_id, ticker,
+        ),
+    )
+    return True
 
 
 def _corroboration_count(

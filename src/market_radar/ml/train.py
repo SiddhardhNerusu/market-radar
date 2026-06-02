@@ -448,6 +448,7 @@ def _load_training_rows(*, require_horizon: str = "return_5d_pct") -> list[dict]
                 ss.author_quality, ss.anti_pump_flag,
                 ss.composite_score, ss.signal_class, ss.scored_at,
                 ss.ticker AS ticker,
+                rs.id AS signal_id,
                 rs.source_tier, rs.published_at,
                 st.confidence AS ticker_confidence,
                 so.return_1d_pct, so.return_5d_pct, so.return_20d_pct,
@@ -459,11 +460,20 @@ def _load_training_rows(*, require_horizon: str = "return_5d_pct") -> list[dict]
             LEFT JOIN llm_classifications lc
                    ON lc.signal_id = ss.signal_id AND lc.ticker = ss.ticker
             WHERE so.{require_horizon} IS NOT NULL
+              -- Noise filter: ~75% of resolved rows are routine regulatory
+              -- backfill (event_type='other' or sec_edgar_backfill_* sources)
+              -- with ~random forward returns. Training on them teaches the
+              -- model the base rate → near-flat ~0.42 predictions. Exclude
+              -- them so the model learns from genuine catalysts. Filter on
+              -- the same COALESCE expression used for the event_type column.
+              AND COALESCE(lc.event_type, ss.event_type) != 'other'
+              AND rs.source NOT LIKE 'sec_edgar_backfill_%'
               -- Outlier filter: stock splits / reverse splits / ticker
               -- reuse can show 1,000%+ returns (e.g., INRE 3,002,400%).
-              -- These poison the model's notion of "winners." Filter to
-              -- realistic ranges only.
-              AND ABS(so.{require_horizon}) < 50.0
+              -- These poison the model's notion of "winners." Loosened from
+              -- 50 → 200 so genuine +50-100% catalyst winners (the strategy's
+              -- target trades) survive while split/data artifacts (>200%) drop.
+              AND ABS(so.{require_horizon}) < 200.0
             """
         ).fetchall()
     return [dict(r) for r in rows]

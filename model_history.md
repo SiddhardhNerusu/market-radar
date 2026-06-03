@@ -77,3 +77,15 @@ Auto-appended by `scripts/scheduled_retrain.py`. Each entry records what changed
 
 ---
 
+## 2026-06-03 11:11 UTC
+
+- **Exit code**: 0 (success)
+- **Old model**: `20260603T030033Z` (val_auc=0.6578)
+- **New model**: `20260603T111216Z` (val_auc=0.6659)
+- **Deployed**: YES
+- **Horizon**: 5 day
+- **Train rows**: 3172 / **Val rows**: 634
+- **Log file**: `retrain-20260603-1111.log`
+
+---
+

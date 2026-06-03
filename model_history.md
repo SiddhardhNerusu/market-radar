@@ -64,3 +64,16 @@ Auto-appended by `scripts/scheduled_retrain.py`. Each entry records what changed
 
 ---
 
+## 2026-06-03 03:00 UTC
+
+- **Exit code**: 1 (FAILED)
+- **Old model**: `20260529T183900Z` (val_auc=0.6144)
+- **New model**: `20260603T030033Z` (val_auc=0.6578)
+- **Deployed**: YES
+- **Horizon**: 5 day
+- **Train rows**: 2839 / **Val rows**: 567
+- **Log file**: `retrain-20260603-0300.log`
+- **Failure reason**: exit code 1 — see log
+
+---
+

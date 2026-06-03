@@ -1691,10 +1691,34 @@ class LiveTrader:
         # rules: volume confirmation, indicator extremes, etc. The conformal
         # gate is meant for ML-prediction signals, not direct observations.)
         is_pa_signal = (cand.get("signal_source") or "").startswith("price_action_")
-        if is_pa_signal:
+        # News-quality CATALYST bypass — mirrors _pick_direction's news_bypass.
+        # A high-conviction catalyst (factual + |sentiment|>=0.5 + composite tier
+        # + high-alpha event type) trades on the SIGNAL, not model_p (~0.5 and
+        # uninformative on news). Without this the direction is picked correctly
+        # but gate_decide(p=0.5) blocks it at "p < min" — the exact reason
+        # earnings/M&A/FDA catalysts NEVER traded despite scoring 'strong'.
+        _ev = cand.get("event_type")
+        _comp_b = float(cand.get("composite_score") or 0)
+        is_news_bypass = (
+            int(cand.get("factual") or 0) == 1
+            and abs(float(cand.get("sentiment") or 0)) >= 0.5
+            and (
+                (_comp_b >= 6.0 and _ev in (
+                    "m_a_announcement", "m_a_confirmed", "activist_position",
+                    "fda_approval", "fda_rejection", "insider_buying_cluster",
+                    "short_squeeze_setup", "spinoff_announcement"))
+                or (_comp_b >= 7.0 and _ev in (
+                    "earnings_beat", "earnings_miss", "guidance_raise", "guidance_cut",
+                    "buyback_announcement", "contract_win_major", "partnership_major"))
+                or (_comp_b >= 7.5 and _ev in (
+                    "analyst_upgrade", "analyst_downgrade", "dividend_cut"))
+            )
+        )
+        if is_pa_signal or is_news_bypass:
             from ..ml.selective_gate import GateDecision
             gate = GateDecision(
-                trade=True, reason="price_action_bypass",
+                trade=True,
+                reason="price_action_bypass" if is_pa_signal else "news_catalyst_bypass",
                 p_calibrated=p, interval_width=None, base_disagreement=None,
             )
         else:
@@ -1774,7 +1798,7 @@ class LiveTrader:
         # the bet (= 0.30 confidence in UP). Using 0.30 here would give
         # negative kelly_raw and block every PA short signal. Pass 0.70
         # for BOTH directions when PA-confident.
-        if is_pa_signal:
+        if is_pa_signal or is_news_bypass:
             sizing_p = 0.70
         else:
             # For ML/news signals: if direction is sell, the bet wins
@@ -3868,8 +3892,17 @@ class LiveTrader:
                     return None
                 return "buy"
             if s < 0:
-                if regime is not None and not regime.allow_shorts and not is_crypto:
-                    return None
+                # Option B: a qualified bearish CATALYST (factual + |sentiment|>=0.5
+                # + high-alpha event type) is stock-specific bad news — let it SHORT
+                # even in a bullish regime, where allow_shorts=False would otherwise
+                # block it. This is how we catch catalyst-driven drops (e.g. AVGO -10%
+                # on bad earnings) instead of sitting long-only through a whole bull
+                # market. We still honour a PANIC halt (size_multiplier<=0); crypto
+                # can't short (blocked downstream); blanket PA/ML shorts stay
+                # regime-vetoed below (those fight the trend, this is bad news).
+                if (regime is not None and regime.size_multiplier <= 0.0
+                        and not is_crypto):
+                    return None  # panic — halt everything
                 return "sell"
 
         # ML/NEWS DEFAULT PATH: require extreme calibrated probability.

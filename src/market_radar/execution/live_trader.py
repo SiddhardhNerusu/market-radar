@@ -148,16 +148,18 @@ class TraderConfig:
     )
 
     # Hard-block list of signal SOURCES excluded from TRADING (prefix-matched
-    # via rs.source LIKE 'source%'). Two reasons a source lands here:
-    #   • negative-EV: 2026-05-31 audit found stocktwits_trending at -1.96% avg
-    #     return (t=-16.5) — noise, not edge.
-    #   • eyes-only (NEW 2026-06-04): alpaca_news is the market-wide catalyst
-    #     firehose. It's scored + Telegram-alerted, but NOT traded yet — these
-    #     are mostly thin micro-caps, and we validate the edge (and add a
-    #     min-price/liquidity gate) before risking capital. To enable trading,
-    #     drop "alpaca_news" from LIVE_BLOCKED_SOURCES and restart.
-    # These are excluded at the candidate query so they never reach a decision.
-    blocked_sources: tuple[str, ...] = ("stocktwits", "alpaca_news")
+    # via rs.source LIKE 'source%'). 2026-05-31 audit found stocktwits_trending
+    # at -1.96% avg return (t=-16.5) — noise, not edge — so it stays blocked.
+    # alpaca_news (the market-wide catalyst firehose) IS allowed to trade as of
+    # 2026-06-04, but only via the min_stock_price liquidity floor below, so the
+    # bot auto-trades catalysts it can realistically fill and skips the sub-$
+    # micro-cap pump zone. Thin names are still scored + Telegram-alerted.
+    blocked_sources: tuple[str, ...] = ("stocktwits",)
+
+    # Liquidity floor for STOCK trades (USD): skip names below this price, where
+    # fills are unreliable and paper P&L is fiction. The main guard now that the
+    # market-wide news firehose can surface thin micro-caps. Crypto is exempt.
+    min_stock_price: float = 5.0
 
     @classmethod
     def from_env(cls) -> "TraderConfig":
@@ -190,6 +192,7 @@ class TraderConfig:
             signal_horizon=os.getenv("LIVE_SIGNAL_HORIZON", "1d").strip().lower(),
             stock_sl_atr_mult=_f("LIVE_STOCK_SL_ATR_MULT", 0.75),
             stock_tp_atr_mult=_f("LIVE_STOCK_TP_ATR_MULT", 1.25),
+            min_stock_price=_f("LIVE_MIN_STOCK_PRICE", 5.0),
             eod_flatten_minutes_before_close=_i("LIVE_EOD_FLATTEN_MIN", 5),
             pdt_enforce=_b("LIVE_PDT_ENFORCE", True),
             pdt_day_trade_limit_per_5d=_i("LIVE_PDT_LIMIT", 3),
@@ -201,7 +204,7 @@ class TraderConfig:
             daily_tp_giveback_usd=_f("LIVE_DAILY_TP_GIVEBACK_USD", 40.0),
             blocked_sources=tuple(
                 s.strip() for s in os.getenv(
-                    "LIVE_BLOCKED_SOURCES", "stocktwits,alpaca_news"
+                    "LIVE_BLOCKED_SOURCES", "stocktwits"
                 ).split(",")
                 if s.strip()
             ),
@@ -1849,6 +1852,7 @@ class LiveTrader:
             tp_atr_mult=self.cfg.stock_tp_atr_mult,
             allow_fractional=is_crypto_sym,
             min_qty=(0.0001 if is_crypto_sym else 1.0),
+            min_entry_price=(0.0 if is_crypto_sym else self.cfg.min_stock_price),
             # Hard per-ticker cap binds on TRUE equity so multipliers can't
             # inflate a position past 6% and get it rejected by the risk gate.
             true_equity_usd=eff_equity,

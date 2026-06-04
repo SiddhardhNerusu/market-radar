@@ -74,6 +74,7 @@ def size_trade(
     tp_atr_mult: float = TP_ATR_MULT,
     min_qty: float = MIN_QTY,
     allow_fractional: bool = False,
+    min_entry_price: float = 0.0,
     true_equity_usd: Optional[float] = None,
     max_notional_usd: Optional[float] = None,
 ) -> SizingResult:
@@ -95,6 +96,11 @@ def size_trade(
 
     if entry_price <= 0:
         return _untradeable("entry_price <= 0", entry_price, atr, 0.0)
+    if min_entry_price > 0 and entry_price < min_entry_price:
+        return _untradeable(
+            f"price ${entry_price:.2f} < liquidity floor ${min_entry_price:.2f}",
+            entry_price, atr, 0.0,
+        )
     if atr <= 0:
         return _untradeable("atr <= 0 — no volatility estimate",
                             entry_price, atr, 0.0)

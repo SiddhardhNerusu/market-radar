@@ -147,12 +147,17 @@ class TraderConfig:
         "material_event_amend", "activist_position",
     )
 
-    # Hard-block list of negative-EV signal SOURCES (prefix-matched via
-    # rs.source LIKE 'source%'). 2026-05-31 audit found stocktwits_trending
-    # had significantly negative measured EV (-1.96% avg return, t=-16.5) —
-    # it injects noise, not edge. Excluded at the candidate query so these
-    # never reach a trade decision. Add sources here as audits find them.
-    blocked_sources: tuple[str, ...] = ("stocktwits",)
+    # Hard-block list of signal SOURCES excluded from TRADING (prefix-matched
+    # via rs.source LIKE 'source%'). Two reasons a source lands here:
+    #   • negative-EV: 2026-05-31 audit found stocktwits_trending at -1.96% avg
+    #     return (t=-16.5) — noise, not edge.
+    #   • eyes-only (NEW 2026-06-04): alpaca_news is the market-wide catalyst
+    #     firehose. It's scored + Telegram-alerted, but NOT traded yet — these
+    #     are mostly thin micro-caps, and we validate the edge (and add a
+    #     min-price/liquidity gate) before risking capital. To enable trading,
+    #     drop "alpaca_news" from LIVE_BLOCKED_SOURCES and restart.
+    # These are excluded at the candidate query so they never reach a decision.
+    blocked_sources: tuple[str, ...] = ("stocktwits", "alpaca_news")
 
     @classmethod
     def from_env(cls) -> "TraderConfig":
@@ -195,7 +200,9 @@ class TraderConfig:
             daily_tp_arm_at_usd=_f("LIVE_DAILY_TP_ARM_USD", 190.0),
             daily_tp_giveback_usd=_f("LIVE_DAILY_TP_GIVEBACK_USD", 40.0),
             blocked_sources=tuple(
-                s.strip() for s in os.getenv("LIVE_BLOCKED_SOURCES", "stocktwits").split(",")
+                s.strip() for s in os.getenv(
+                    "LIVE_BLOCKED_SOURCES", "stocktwits,alpaca_news"
+                ).split(",")
                 if s.strip()
             ),
         )

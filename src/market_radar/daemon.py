@@ -60,6 +60,7 @@ log = logging.getLogger("marketradar.daemon")
 DEFAULTS = {
     "sec_edgar_seconds":   5 * 60,
     "rss_news_seconds":    3 * 60,
+    "alpaca_news_seconds": 60,          # market-wide catalyst firehose — time-sensitive
     "reddit_seconds":      3 * 60,
     "stocktwits_seconds":  2 * 60,
     "earnings_calendar_seconds": 12 * 60 * 60,  # twice a day — Finnhub free tier
@@ -102,6 +103,17 @@ def _job_sec_edgar() -> None:
 
 def _job_rss_news() -> None:
     RssNewsIngestor().poll()
+
+def _job_alpaca_news() -> None:
+    """Pull the market-wide Alpaca/Benzinga news firehose (every ticker).
+
+    This is the blind-spot fix for micro-cap catalyst PRs (e.g. VERU +159% on a
+    Novo Nordisk deal that we never saw). No-ops cleanly when creds are missing.
+    """
+    if not (CONFIG.alpaca_api_key and CONFIG.alpaca_api_secret):
+        return
+    from .ingestors.alpaca_news import AlpacaNewsIngestor
+    AlpacaNewsIngestor().poll()
 
 def _job_reddit() -> None:
     # Disabled 2026-05-29: Reddit public JSON returns 6,930 HTTP 403s/day
@@ -228,6 +240,7 @@ def build_scheduler() -> BackgroundScheduler:
     jobs = [
         ("sec_edgar",      _job_sec_edgar,      DEFAULTS["sec_edgar_seconds"]),
         ("rss_news",       _job_rss_news,       DEFAULTS["rss_news_seconds"]),
+        ("alpaca_news",    _job_alpaca_news,    DEFAULTS["alpaca_news_seconds"]),
         ("reddit",         _job_reddit,         DEFAULTS["reddit_seconds"]),
         ("stocktwits",     _job_stocktwits,     DEFAULTS["stocktwits_seconds"]),
         ("earnings_cal",   _job_earnings_calendar, DEFAULTS["earnings_calendar_seconds"]),

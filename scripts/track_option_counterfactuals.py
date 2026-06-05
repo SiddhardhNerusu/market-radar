@@ -67,8 +67,8 @@ def main() -> int:
             snaps = opts.get_snapshots([long_sym, short_sym])
             lq, sq = snaps.get(long_sym), snaps.get(short_sym)
             if lq is not None and sq is not None:
-                long_mid = lq.effective_mid()
-                short_mid = sq.effective_mid()
+                long_mid = lq.effective_mid
+                short_mid = sq.effective_mid
                 have_quote = long_mid > 0 and short_mid > 0
         except Exception as exc:  # noqa: BLE001
             print(f"  [warn] snapshot failed for spread {s['id']} ({s['underlying']}): {exc}")

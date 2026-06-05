@@ -1350,6 +1350,27 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Step 4: process one candidate (dispatch stock vs options)
     # ------------------------------------------------------------------
+    def _is_news_catalyst(self, cand: dict) -> bool:
+        """True if this candidate qualifies as a NEWS CATALYST (the news-bypass
+        tiers, using the shared event-tier constants). Options are RESERVED for
+        catalysts as of 2026-06-05 — price-action / model-only signals route to
+        stock instead, because PA-momentum-into-options drew the day's loss
+        (bullish short-dated spreads taken at the open, market reversed)."""
+        try:
+            if int(cand.get("factual") or 0) != 1:
+                return False
+            if abs(float(cand.get("sentiment") or 0)) < 0.5:
+                return False
+            ev = cand.get("event_type")
+            comp = float(cand.get("composite_score") or 0)
+            return (
+                (comp >= 6.0 and ev in SEC_HIGH_ALPHA_EVENTS)
+                or (comp >= 7.0 and ev in NEWS_MEDIUM_ALPHA_EVENTS)
+                or (comp >= 7.5 and ev in NEWS_LOWER_ALPHA_EVENTS)
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     def _process_candidate(self, cand: dict, *, account, market_open: bool,
                             positions=None) -> None:
         symbol = cand["symbol"]
@@ -1373,14 +1394,15 @@ class LiveTrader:
             )
             return
 
-        # OPEN UNIVERSE: for ANY US stock candidate (no '/' = not crypto),
-        # try options first if enabled. If the spread can't be built
-        # (no chain / illiquid / wide spread), the options path will signal
-        # fallback via return value False, and we route to the stock path.
+        # Options are RESERVED for NEWS CATALYSTS (2026-06-05): only a qualifying
+        # catalyst routes to the options spread path; price-action / model-only
+        # signals trade as stock. (PA-momentum-into-options drew the day's loss.)
+        # A catalyst whose spread is unbuildable falls back to stock.
         is_crypto_sym = "/" in symbol
         if (self.cfg.options_enabled
                 and self.options is not None
-                and not is_crypto_sym):
+                and not is_crypto_sym
+                and self._is_news_catalyst(cand)):
             routed = self._process_option_candidate(
                 cand, direction=direction, account=account, market_open=market_open,
                 positions=positions,

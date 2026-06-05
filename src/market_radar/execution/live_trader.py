@@ -55,6 +55,30 @@ from .sizer import SizingResult, get_atr, size_trade
 log = logging.getLogger("marketradar.execution.live_trader")
 
 
+# ── News-catalyst bypass event types, by alpha tier (SINGLE SOURCE OF TRUTH) ──
+# These MUST be tokens the LLM classifier actually emits (see llm/prompt.py) — a
+# mismatch silently disables a whole catalyst class (the 2026-06-05 audit bug,
+# where 'buyback_announcement'/'contract_win_major'/etc. never matched the real
+# 'buyback'/'contract_award'). Consumed by: the candidate SQL filter, the stock +
+# options gates, and _pick_direction. EDIT HERE ONLY — do not re-inline copies.
+SEC_HIGH_ALPHA_EVENTS = (
+    "m_a_announcement", "activist_position", "fda_approval", "fda_rejection",
+    "insider_buy", "stock_split", "short_seller_report", "clinical_trial_result",
+)
+NEWS_MEDIUM_ALPHA_EVENTS = (
+    "earnings_beat", "earnings_miss", "guidance_raise", "guidance_cut",
+    "buyback", "contract_award", "product_launch",
+)
+NEWS_LOWER_ALPHA_EVENTS = (
+    "analyst_upgrade", "analyst_downgrade", "dividend",
+)
+
+
+def _sql_event_in(events: tuple) -> str:
+    """Render event types as a SQL IN-list literal: 'a','b','c'."""
+    return ",".join("'" + e + "'" for e in events)
+
+
 @dataclass
 class TraderConfig:
     # Composite score is RETAINED as a soft filter only (default 0 = off) because
@@ -1227,15 +1251,9 @@ class LiveTrader:
             "  COALESCE(ss.factual, 0) = 1 "
             "  AND ABS(COALESCE(ss.sentiment, 0)) >= 0.5 "
             "  AND ("
-            "    (ss.composite_score >= 6.0 AND ss.event_type IN ("
-            "      'm_a_announcement','m_a_confirmed','activist_position',"
-            "      'fda_approval','fda_rejection','insider_buying_cluster',"
-            "      'short_squeeze_setup','spinoff_announcement'))"
-            "    OR (ss.composite_score >= 7.0 AND ss.event_type IN ("
-            "      'earnings_beat','earnings_miss','guidance_raise','guidance_cut',"
-            "      'buyback_announcement','contract_win_major','partnership_major'))"
-            "    OR (ss.composite_score >= 7.5 AND ss.event_type IN ("
-            "      'analyst_upgrade','analyst_downgrade','dividend_cut'))"
+            f"    (ss.composite_score >= 6.0 AND ss.event_type IN ({_sql_event_in(SEC_HIGH_ALPHA_EVENTS)}))"
+            f"    OR (ss.composite_score >= 7.0 AND ss.event_type IN ({_sql_event_in(NEWS_MEDIUM_ALPHA_EVENTS)}))"
+            f"    OR (ss.composite_score >= 7.5 AND ss.event_type IN ({_sql_event_in(NEWS_LOWER_ALPHA_EVENTS)}))"
             "  )"
             ")"
         )
@@ -1363,6 +1381,20 @@ class LiveTrader:
         score_id = cand["score_id"]
         # Same PA bypass applies to options path
         is_pa_signal = (cand.get("signal_source") or "").startswith("price_action_")
+        # News-catalyst bypass — SAME logic as the stock path. Without this,
+        # catalyst-driven OPTIONS trades carry model_p ~0.5 and die at the risk
+        # manager's min_p rule (2026-06-05 audit: stocks had the fix, options didn't).
+        _ev_o = cand.get("event_type")
+        _comp_o = float(cand.get("composite_score") or 0)
+        is_news_bypass = (
+            int(cand.get("factual") or 0) == 1
+            and abs(float(cand.get("sentiment") or 0)) >= 0.5
+            and (
+                (_comp_o >= 6.0 and _ev_o in SEC_HIGH_ALPHA_EVENTS)
+                or (_comp_o >= 7.0 and _ev_o in NEWS_MEDIUM_ALPHA_EVENTS)
+                or (_comp_o >= 7.5 and _ev_o in NEWS_LOWER_ALPHA_EVENTS)
+            )
+        )
 
         # Options markets only when stock market is open (Alpaca options follow
         # equity hours, no pre/post). Skip if closed.
@@ -1378,8 +1410,9 @@ class LiveTrader:
         # CRITICAL: PA signals have model_p ≈ 0.42 (ML isn't trained on raw
         # price-action setups). Pass the SAME synthetic high-conviction p
         # we use for sizing/risk — otherwise Kelly returns negative, every
-        # PA-driven spread is "unbuildable", and options NEVER fire.
-        builder_p = (0.70 if direction == "buy" else 0.30) if is_pa_signal else p
+        # PA-driven spread is "unbuildable", and options NEVER fire. News
+        # catalysts get the same treatment (model_p ~0.5; the edge is the event).
+        builder_p = (0.70 if direction == "buy" else 0.30) if (is_pa_signal or is_news_bypass) else p
         eff_equity = self._effective_equity(account)
         # Pass composite + |sentiment| so the sizer can trigger high-conviction
         # 8% cap on strong PA signals (where model_p stays at 0.42 and the
@@ -1436,9 +1469,9 @@ class LiveTrader:
             log.info("[%s OPT] skip: %s", symbol, sizing.reason)
             return
 
-        # Risk manager — reuse same caps as stock path. PA signals get the
-        # same synthetic-p substitution as the stock path.
-        risk_p = (0.70 if direction == "buy" else 0.30) if is_pa_signal else p
+        # Risk manager — reuse same caps as stock path. PA + news-catalyst
+        # signals get the same synthetic-p substitution as the stock path.
+        risk_p = (0.70 if direction == "buy" else 0.30) if (is_pa_signal or is_news_bypass) else p
         proposal = TradeProposal(
             ticker=symbol, direction=direction, size_pct=sizing.size_pct,
             calibrated_p=risk_p, sector=SECTOR_MAP.get(symbol.upper()),
@@ -1713,15 +1746,9 @@ class LiveTrader:
             int(cand.get("factual") or 0) == 1
             and abs(float(cand.get("sentiment") or 0)) >= 0.5
             and (
-                (_comp_b >= 6.0 and _ev in (
-                    "m_a_announcement", "m_a_confirmed", "activist_position",
-                    "fda_approval", "fda_rejection", "insider_buying_cluster",
-                    "short_squeeze_setup", "spinoff_announcement"))
-                or (_comp_b >= 7.0 and _ev in (
-                    "earnings_beat", "earnings_miss", "guidance_raise", "guidance_cut",
-                    "buyback_announcement", "contract_win_major", "partnership_major"))
-                or (_comp_b >= 7.5 and _ev in (
-                    "analyst_upgrade", "analyst_downgrade", "dividend_cut"))
+                (_comp_b >= 6.0 and _ev in SEC_HIGH_ALPHA_EVENTS)
+                or (_comp_b >= 7.0 and _ev in NEWS_MEDIUM_ALPHA_EVENTS)
+                or (_comp_b >= 7.5 and _ev in NEWS_LOWER_ALPHA_EVENTS)
             )
         )
         if is_pa_signal or is_news_bypass:
@@ -2846,7 +2873,7 @@ class LiveTrader:
                        s.expiration_date, s.contracts, s.entry_debit_usd,
                        s.total_debit_usd, s.max_gain_usd, s.submitted_at
                 FROM bot_option_spreads s
-                WHERE s.closed_at IS NULL AND s.status IN ('filled','accepted','new')
+                WHERE s.closed_at IS NULL AND s.status = 'filled'
                 """
             ).fetchall()
             if not open_spreads:
@@ -3681,9 +3708,26 @@ class LiveTrader:
                 ]
                 try:
                     import time as _t_eod_opt
+                    # Multi-leg market orders aren't supported, and limit_price=None
+                    # crashed _round_price → EOD flatten silently failed → spreads
+                    # held overnight (2026-06-05 audit bug). Compute the current
+                    # spread mark (long_mid - short_mid) and close at that limit,
+                    # mirroring the normal exit path; fall back to the entry debit.
+                    _close_limit = max(float(sp_d["entry_debit_usd"]), 0.01)
+                    try:
+                        _q = self.options.get_snapshots(
+                            [L["contract_symbol"] for L in legs])
+                        _lq = next((_q.get(L["contract_symbol"]) for L in legs
+                                    if L["side"] == "buy"), None)
+                        _sq = next((_q.get(L["contract_symbol"]) for L in legs
+                                    if L["side"] == "sell"), None)
+                        if _lq and _sq and _lq.mid > 0 and _sq.mid > 0:
+                            _close_limit = max(_lq.mid - _sq.mid, 0.01)
+                    except Exception:  # noqa: BLE001 — fall back to entry debit
+                        pass
                     mleg = self.options.submit_multi_leg(
                         legs=close_legs, qty=int(sp_d["contracts"]),
-                        limit_price=None,  # market close at EOD
+                        limit_price=_close_limit,
                         client_order_id=f"mr-eod-opt-{sp_d['id']}-{_t_eod_opt.time_ns()}",
                     )
                     # Mark closed immediately so the poller stops; then book
@@ -3875,28 +3919,17 @@ class LiveTrader:
                 return "sell"
             return None
 
-        # NEWS-QUALITY BYPASS PATH — matches SQL news_bypass_clause exactly.
-        # Tiered thresholds: SEC events bypass at 6.0, news at 7.0, analyst at 7.5.
-        SEC_HIGH_ALPHA = {
-            "m_a_announcement", "m_a_confirmed", "activist_position",
-            "fda_approval", "fda_rejection", "insider_buying_cluster",
-            "short_squeeze_setup", "spinoff_announcement",
-        }
-        NEWS_MEDIUM_ALPHA = {
-            "earnings_beat", "earnings_miss", "guidance_raise", "guidance_cut",
-            "buyback_announcement", "contract_win_major", "partnership_major",
-        }
-        NEWS_LOWER_ALPHA = {
-            "analyst_upgrade", "analyst_downgrade", "dividend_cut",
-        }
+        # NEWS-QUALITY BYPASS PATH — uses the shared event-tier constants
+        # (single source of truth at module top; kept in sync with the SQL
+        # candidate filter + the stock/options gates). SEC 6.0, news 7.0, analyst 7.5.
         news_bypass_qualifies = (
             factual == 1
             and sentiment is not None and abs(float(sentiment)) >= 0.5
             and composite is not None
             and (
-                (composite >= 6.0 and event_type in SEC_HIGH_ALPHA)
-                or (composite >= 7.0 and event_type in NEWS_MEDIUM_ALPHA)
-                or (composite >= 7.5 and event_type in NEWS_LOWER_ALPHA)
+                (composite >= 6.0 and event_type in SEC_HIGH_ALPHA_EVENTS)
+                or (composite >= 7.0 and event_type in NEWS_MEDIUM_ALPHA_EVENTS)
+                or (composite >= 7.5 and event_type in NEWS_LOWER_ALPHA_EVENTS)
             )
         )
         if news_bypass_qualifies:

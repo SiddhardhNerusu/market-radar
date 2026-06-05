@@ -106,6 +106,7 @@ class RiskManager:
         current_notional_usd: Optional[float] = None,
         current_crypto_usd: Optional[float] = None,
         current_ticker_usd: Optional[float] = None,
+        current_position_count: Optional[int] = None,
         market_open: bool = True,
     ) -> RiskDecision:
         # Input sanity — fail closed on malformed proposals.
@@ -318,7 +319,20 @@ class RiskManager:
                 "max_sector_pct",
             )
 
-        return RiskDecision(True, "all 7 rules passed")
+        # Rule 8: concentration / pile-on cap — limit the number of distinct
+        # open names so the book can't load up on many correlated bets at once
+        # (2026-06-05 lesson: ~10 simultaneous bullish positions all sank
+        # together). Applies only when the caller supplies the live count.
+        if (current_position_count is not None
+                and current_position_count >= CONFIG.risk_max_concurrent_positions):
+            return RiskDecision(
+                False,
+                f"Concentration cap: {current_position_count} open names "
+                f">= {CONFIG.risk_max_concurrent_positions} (avoid correlated pile-on)",
+                "max_concurrent_positions",
+            )
+
+        return RiskDecision(True, "all 8 rules passed")
 
     # ------------------------------------------------------------------
     # Helpers — every one is read-only and fails closed.

@@ -1350,6 +1350,19 @@ class LiveTrader:
     # ------------------------------------------------------------------
     # Step 4: process one candidate (dispatch stock vs options)
     # ------------------------------------------------------------------
+    @staticmethod
+    def _distinct_position_count(positions) -> int:
+        """Count distinct underlying names open now (an option spread's legs
+        collapse to one underlying). Feeds the risk manager's concentration cap
+        so the book can't pile into many correlated bets at once."""
+        import re
+        names = set()
+        for p in (positions or []):
+            m = re.match(r"^[A-Z]+", (getattr(p, "symbol", "") or "").upper())
+            if m:
+                names.add(m.group())
+        return len(names)
+
     def _is_news_catalyst(self, cand: dict) -> bool:
         """True if this candidate qualifies as a NEWS CATALYST (the news-bypass
         tiers, using the shared event-tier constants). Options are RESERVED for
@@ -1558,6 +1571,8 @@ class LiveTrader:
             account_equity_usd=self._effective_equity(account),
             current_gross_usd=alpaca_gross,
             current_notional_usd=sizing.total_debit_usd,
+            current_position_count=(self._distinct_position_count(positions)
+                                    if positions is not None else None),
         )
         if not decision.allowed:
             self._persist_decision(
@@ -2022,6 +2037,8 @@ class LiveTrader:
             current_notional_usd=sized.notional_usd,
             current_crypto_usd=alpaca_crypto,
             current_ticker_usd=alpaca_ticker,
+            current_position_count=(self._distinct_position_count(positions)
+                                    if positions is not None else None),
             market_open=market_open,
         )
         if not decision.allowed:

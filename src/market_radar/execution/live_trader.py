@@ -355,13 +355,14 @@ class LiveTrader:
         try:
             with get_connection() as conn:
                 # Ensure columns exist (idempotent — silent on already-exist)
-                for col, ctype in [("tp_fired", "INTEGER"), ("tp_peak_usd", "REAL")]:
+                for col, ctype in [("tp_fired", "INTEGER"), ("tp_peak_usd", "REAL"),
+                                   ("loss_halt_fired", "INTEGER")]:
                     try:
                         conn.execute(f"ALTER TABLE bot_daily_pnl ADD COLUMN {col} {ctype}")
                     except Exception:  # noqa: BLE001
                         pass
                 row = conn.execute(
-                    "SELECT tp_fired, tp_peak_usd FROM bot_daily_pnl WHERE trading_date=?",
+                    "SELECT tp_fired, tp_peak_usd, loss_halt_fired FROM bot_daily_pnl WHERE trading_date=?",
                     (_us_eastern_date().isoformat(),),
                 ).fetchone()
             if row and row[0]:
@@ -370,6 +371,12 @@ class LiveTrader:
                 self._daily_tp_peak = row[1] or 0.0
                 log.warning("🎯 Loaded TP state from DB: ALREADY FIRED today, peak was $%.2f",
                             self._daily_tp_peak or 0)
+            # Restore the loss-halt flag too, so a restart during a halted day
+            # keeps new entries blocked (don't re-expose the account).
+            if row and len(row) > 2 and row[2]:
+                self._daily_loss_halt_on = _date.today()
+                log.warning("🛑 Loaded loss-halt state from DB: ALREADY HALTED today "
+                            "— new entries stay blocked until tomorrow.")
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not load daily TP state: %s", exc)
 
@@ -391,6 +398,26 @@ class LiveTrader:
                 )
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not persist daily TP state: %s", exc)
+
+    def _persist_loss_halt_state(self) -> None:
+        """Persist the daily loss-halt flag so a restart during a halted day
+        still blocks new entries (mirrors _persist_daily_tp_state). The
+        equity-delta daily cap (risk Rule 2) is the backstop; this is the fast
+        path so we don't re-expose for a loop or two until reconcile re-syncs."""
+        try:
+            with get_connection() as conn:
+                conn.execute(
+                    """INSERT INTO bot_daily_pnl
+                       (trading_date, realized_pnl_usd, trades_count, wins, losses,
+                        largest_win, largest_loss, updated_at, loss_halt_fired)
+                       VALUES (?, 0, 0, 0, 0, 0, 0, ?, 1)
+                       ON CONFLICT(trading_date) DO UPDATE SET
+                         loss_halt_fired = 1,
+                         updated_at = excluded.updated_at""",
+                    (_us_eastern_date().isoformat(), utc_now()),
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not persist loss-halt state: %s", exc)
 
     def _reconcile_option_spreads(self) -> None:
         """Sync bot_option_spreads.status with Alpaca reality.
@@ -808,6 +835,9 @@ class LiveTrader:
             log.exception("Options exit poll failed: %s", exc)
 
         # Step 2b.5: poll & exit crypto positions at SL/TP (Alpaca crypto = no brackets)
+        # Track symbols closed this loop so the flip check below doesn't double-close
+        # (and double-book P&L) a position the SL/TP poller just closed.
+        self._closed_this_loop = set()
         try:
             self._poll_crypto_exits(positions)
         except Exception as exc:  # noqa: BLE001
@@ -2434,6 +2464,7 @@ class LiveTrader:
                 with get_connection() as conn:
                     self._update_daily_pnl(conn, pnl)
                     self._book_crypto_exit_pnl(conn, pair, qty, entry, pnl)
+                self._closed_this_loop.add(pair)  # guard the flip check from double-booking
                 try:
                     from ..notifications.realtime import TradeAlert, notify_trade
                     headline = None
@@ -2550,6 +2581,8 @@ class LiveTrader:
                 "(composite=%.1f sentiment=%+.2f from %s) — cutting loser",
                 slashed, held_dir, loss_pct*100, opp[0], opp[1], opp[2],
             )
+            if slashed in getattr(self, "_closed_this_loop", set()):
+                continue  # SL/TP poller already closed this symbol this loop — no double-book
             try:
                 close_side = "sell" if held_dir == "buy" else "buy"
                 self.alpaca.submit_simple_order(
@@ -3188,6 +3221,7 @@ class LiveTrader:
             if not already_halted:
                 # FIRST trigger this day: arm the halt + alert once.
                 self._daily_loss_halt_on = today
+                self._persist_loss_halt_state()  # survive a restart — don't re-expose
                 log.error(
                     "🛑 DAILY LOSS STOP: intraday $%.2f <= -$%.2f — SELECTIVE "
                     "de-risk: cutting %d loser(s), keeping %d winner(s) on their "

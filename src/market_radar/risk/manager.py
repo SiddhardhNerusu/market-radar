@@ -150,6 +150,12 @@ class RiskManager:
         # Rule 2b: monthly drawdown halt — if equity is $X below 30-day peak,
         # halt and require manual review. Protects against compound bad weeks.
         drawdown_breached = self._monthly_drawdown_breached()
+        if drawdown_breached is self._DD_CHECK_ERROR:
+            return RiskDecision(
+                False,
+                "Monthly drawdown check failed (data unavailable) — failing closed",
+                "monthly_drawdown",
+            )
         if drawdown_breached:
             peak, current, dd = drawdown_breached
             return RiskDecision(
@@ -297,6 +303,12 @@ class RiskManager:
         # Rule 7b: per-sector concentration
         sector = (t.sector or SECTOR_MAP.get(ticker, "other")).lower()
         sector_now_pct = self._current_sector_exposure_pct(sector, account_equity_usd)
+        if sector_now_pct is None:  # exposure unreadable (data error) — fail closed
+            return RiskDecision(
+                False,
+                "Sector exposure unavailable (data error) — failing closed",
+                "max_sector_pct",
+            )
         sector_after = sector_now_pct + t.size_pct
         if sector_after > CONFIG.risk_max_sector_pct:
             return RiskDecision(
@@ -341,6 +353,12 @@ class RiskManager:
             log.warning("risk._today_realized_pnl_usd failed: %s", exc)
             return None
 
+    # Sentinel returned by _monthly_drawdown_breached ONLY on a check ERROR
+    # (DB unreachable) — distinct from a clean "not breached" (None). The caller
+    # fails CLOSED on this; a clean None still allows trading. (Without this,
+    # error and not-breached both returned None → fail-OPEN on DB error.)
+    _DD_CHECK_ERROR = object()
+
     def _monthly_drawdown_breached(self) -> Optional[tuple[float, float, float]]:
         """Check if equity is more than `risk_monthly_drawdown_usd` below
         the 30-day rolling peak. Returns (peak, current, drawdown) when
@@ -371,7 +389,7 @@ class RiskManager:
             return None
         except Exception as exc:  # noqa: BLE001
             log.warning("risk._monthly_drawdown_breached failed: %s", exc)
-            return None
+            return self._DD_CHECK_ERROR  # fail CLOSED at caller (distinct from not-breached None)
 
     def _today_trade_count(self) -> int:
         """Number of orders placed today (UTC) on Alpaca. Fails closed."""

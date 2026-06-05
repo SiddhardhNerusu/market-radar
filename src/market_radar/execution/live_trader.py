@@ -1877,12 +1877,15 @@ class LiveTrader:
             log.info("[%s] sizing rejected: %s", symbol, sized.reason)
             return
 
-        # Risk manager (7 hard rules, fed by Alpaca state). For price-action
-        # signals we substitute calibrated_p with a synthetic value derived
-        # from sentiment so we don't trip the risk manager's min_p rule —
-        # the price-action scanner has its own edge proof (volume, indicator
-        # extremes) that the risk manager's prob-based gate doesn't see.
-        if is_pa_signal:
+        # Risk manager (7 hard rules, fed by Alpaca state). For price-action AND
+        # news-catalyst signals we substitute calibrated_p with a synthetic
+        # conviction value so we don't trip the risk manager's min_p rule. These
+        # names carry model_p ~0.50 (the ML model has no opinion on out-of-universe
+        # catalyst tickers); their edge is the EVENT — factual news + sentiment +
+        # event-type — already proven by the news-bypass gate, not model_p. The
+        # other six risk rules (exposure, sector, daily-loss, …) still apply, and
+        # this mirrors the sizing path, which already gives both a synthetic 0.70.
+        if is_pa_signal or is_news_bypass:
             sentiment = cand.get("sentiment") or 0.0
             synth_p = 0.70 if direction == "buy" else 0.30
             risk_p = synth_p

@@ -529,10 +529,16 @@ class AlpacaClient:
         limit_price: Optional[float] = None,
         time_in_force: TimeInForce = "gtc",
         client_order_id: Optional[str] = None,
+        position_intent: Optional[str] = None,
     ) -> Order:
         """Submit a simple non-bracket order. Used for crypto (Alpaca does
         NOT support bracket orders on crypto) and any other case where the
-        bot manages stop/TP itself via polling."""
+        bot manages stop/TP itself via polling.
+
+        ``position_intent`` (buy_to_open / sell_to_open / buy_to_close /
+        sell_to_close) is REQUIRED by Alpaca to close a single option leg —
+        without it the close order is rejected. Crypto/stock callers leave it
+        None."""
         if qty <= 0:
             raise AlpacaError(f"qty must be > 0, got {qty}")
         payload: dict[str, Any] = {
@@ -543,6 +549,8 @@ class AlpacaClient:
             "time_in_force": time_in_force,
             "client_order_id": client_order_id or f"mr-s-{uuid.uuid4().hex[:18]}",
         }
+        if position_intent is not None:
+            payload["position_intent"] = position_intent
         if limit_price is not None:
             payload["limit_price"] = _round_price(limit_price)
         d = self._request("POST", "/v2/orders", json=payload)

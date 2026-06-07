@@ -3454,9 +3454,13 @@ class LiveTrader:
                 side = "sell" if float(p.qty) > 0 else "buy"
                 if is_option:
                     # Option legs need explicit simple_order (close_position 403s on naked legs)
+                    # AND an explicit position_intent or Alpaca rejects the close — this is
+                    # what historically left the loss-stop unable to cut option losers (they
+                    # ran until manual close). side=="sell" closes a long leg, "buy" a short.
                     self.alpaca.submit_simple_order(
                         symbol=sym, side=side, qty=qty,
                         order_type="market", time_in_force="day",
+                        position_intent=("sell_to_close" if side == "sell" else "buy_to_close"),
                         client_order_id=f"tpfire-{sym[:10]}-{_time.time_ns()}",
                     )
                 elif is_crypto:

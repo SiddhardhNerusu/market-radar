@@ -530,6 +530,7 @@ class AlpacaClient:
         time_in_force: TimeInForce = "gtc",
         client_order_id: Optional[str] = None,
         position_intent: Optional[str] = None,
+        extended_hours: bool = False,
     ) -> Order:
         """Submit a simple non-bracket order. Used for crypto (Alpaca does
         NOT support bracket orders on crypto) and any other case where the
@@ -538,7 +539,12 @@ class AlpacaClient:
         ``position_intent`` (buy_to_open / sell_to_open / buy_to_close /
         sell_to_close) is REQUIRED by Alpaca to close a single option leg —
         without it the close order is rejected. Crypto/stock callers leave it
-        None."""
+        None.
+
+        ``extended_hours`` routes the order into the pre/after-market session.
+        Alpaca only accepts it on a LIMIT DAY order (no market/stop/bracket
+        outside regular hours), so callers must pass order_type='limit',
+        time_in_force='day' and a limit_price alongside it."""
         if qty <= 0:
             raise AlpacaError(f"qty must be > 0, got {qty}")
         payload: dict[str, Any] = {
@@ -551,6 +557,8 @@ class AlpacaClient:
         }
         if position_intent is not None:
             payload["position_intent"] = position_intent
+        if extended_hours:
+            payload["extended_hours"] = True
         if limit_price is not None:
             payload["limit_price"] = _round_price(limit_price)
         d = self._request("POST", "/v2/orders", json=payload)

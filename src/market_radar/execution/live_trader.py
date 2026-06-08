@@ -844,6 +844,15 @@ class LiveTrader:
         except Exception as exc:  # noqa: BLE001
             log.exception("Crypto exit poll failed: %s", exc)
 
+        # Step 2b.7: poll & exit EXTENDED-HOURS stock positions at SL/TP. These were
+        # entered as simple limit orders (no server-side bracket), so this poller is
+        # their only stop/TP. Regular-hours bracket stocks are untouched (filtered by
+        # outcome_detail='stock_ext_polled').
+        try:
+            self._poll_stock_exits(positions)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Stock (ext-hours) exit poll failed: %s", exc)
+
         # Step 2b.6: crypto reversal flip — close held crypto when strong
         # opposite-direction price-action signal arrives. Frees the symbol so
         # next iteration can re-enter the new direction.
@@ -2200,22 +2209,35 @@ class LiveTrader:
                 placed_qty = fractional_qty
                 placed_kind = "simple_market_crypto"
             else:
-                # Extended-hours flag: True when market is closed but
-                # allow_after_hours is enabled. Alpaca requires limit_price
-                # for extended-hours fills (no market orders allowed).
                 ext_hours = (not market_open) and self.cfg.allow_after_hours
-                bracket = self.alpaca.submit_bracket_order(
-                    symbol=symbol, side=direction, qty=sized.qty,
-                    take_profit=sized.take_profit, stop_loss=sized.stop_loss,
-                    time_in_force="day",
-                    client_order_id=client_order_id,
-                    extended_hours=ext_hours,
-                    limit_price=(entry if ext_hours else None),
-                )
-                placed_id = bracket.parent.id
-                placed_qty = sized.qty
-                placed_kind = ("bracket_submitted_extended"
-                               if ext_hours else "bracket_submitted")
+                if ext_hours:
+                    # EXTENDED HOURS: Alpaca forbids bracket / stop / market orders
+                    # outside regular hours — only simple LIMIT DAY orders with
+                    # extended_hours=True. So enter with a marketable limit (priced
+                    # slightly THROUGH the quote to fill in thin pre/after-hours
+                    # liquidity) and manage SL/TP via _poll_stock_exits (there is no
+                    # server-side bracket to protect this position — the poller is it).
+                    buf = 1.003 if direction == "buy" else 0.997
+                    limit_px = round(float(entry) * buf, 2)
+                    simple = self.alpaca.submit_simple_order(
+                        symbol=symbol, side=direction, qty=sized.qty,
+                        order_type="limit", limit_price=limit_px,
+                        time_in_force="day", extended_hours=True,
+                        client_order_id=client_order_id,
+                    )
+                    placed_id = simple.id
+                    placed_qty = sized.qty
+                    placed_kind = "stock_ext_polled"
+                else:
+                    bracket = self.alpaca.submit_bracket_order(
+                        symbol=symbol, side=direction, qty=sized.qty,
+                        take_profit=sized.take_profit, stop_loss=sized.stop_loss,
+                        time_in_force="day",
+                        client_order_id=client_order_id,
+                    )
+                    placed_id = bracket.parent.id
+                    placed_qty = sized.qty
+                    placed_kind = "bracket_submitted"
         except AlpacaError as exc:
             with get_connection() as conn:
                 conn.execute(
@@ -2394,6 +2416,139 @@ class LiveTrader:
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("_book_crypto_exit_pnl(%s) failed: %s", pair, exc)
+
+    def _poll_stock_exits(self, positions) -> None:
+        """Poll EXTENDED-HOURS stock positions and close them at their recorded SL/TP.
+
+        These were entered by _process_stock_candidate as simple LIMIT orders
+        (outcome_detail='stock_ext_polled') because Alpaca forbids bracket/stop/market
+        orders outside regular hours — so they have NO server-side bracket and THIS
+        poller is their only stop/TP protection. Regular-hours bracket stocks are
+        protected by Alpaca server-side and are NOT touched here (the query filters
+        on the marker). Closes use a market order in regular hours, or a marketable
+        limit with extended_hours=True when the market is closed. P&L is an estimate
+        (reconciliation/EOD corrects). A 120s per-ticker cooldown stops duplicate
+        close orders stacking while a thin-liquidity limit close is still working.
+        """
+        import time as _t_sx
+        stock_positions = [p for p in positions
+                           if "/" not in p.symbol and len(p.symbol) <= 9]
+        open_syms = {p.symbol.upper() for p in stock_positions}
+
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT ticker, direction, stop_loss, take_profit, score_id
+                FROM bot_decisions
+                WHERE outcome='placed' AND outcome_detail='stock_ext_polled'
+                  AND ticker NOT LIKE '%/%'
+                  AND stop_loss IS NOT NULL AND take_profit IS NOT NULL
+                ORDER BY id DESC
+                """
+            ).fetchall()
+        sl_tp_by_sym: dict[str, dict] = {}
+        for r in rows:
+            sl_tp_by_sym.setdefault(r["ticker"].upper(), dict(r))
+
+        # Cleanup: any ticker we submitted a close for that is no longer an open
+        # position has exited — mark its decision closed so we don't re-manage a
+        # phantom (the bug that bit the option spreads). Also fires when all stocks
+        # are flat (open_syms empty).
+        if hasattr(self, "_stock_exit_attempts"):
+            for sym in list(self._stock_exit_attempts.keys()):
+                if sym not in open_syms:
+                    td = sl_tp_by_sym.get(sym)
+                    if td:
+                        with get_connection() as conn:
+                            conn.execute(
+                                "UPDATE bot_decisions SET outcome='closed', "
+                                "outcome_detail='stock_ext_exited' WHERE score_id=?",
+                                (td["score_id"],),
+                            )
+                    self._stock_exit_attempts.pop(sym, None)
+
+        if not sl_tp_by_sym or not stock_positions:
+            return
+
+        market_open = self.alpaca.is_market_open()
+        if not hasattr(self, "_stock_exit_attempts"):
+            self._stock_exit_attempts = {}
+        now_ts = _t_sx.time()
+
+        for p in stock_positions:
+            sym = p.symbol.upper()
+            tp_sl = sl_tp_by_sym.get(sym)
+            if not tp_sl:
+                continue
+            current_price = float(p.current_price) if p.current_price else None
+            if not current_price:
+                latest = self.alpaca.get_latest_trade(p.symbol)
+                if not latest:
+                    continue
+                current_price = float(latest)
+            sl = float(tp_sl["stop_loss"])
+            tp = float(tp_sl["take_profit"])
+            direction = tp_sl["direction"]
+
+            exit_reason = None
+            if direction == "buy":
+                if current_price >= tp:
+                    exit_reason = "take_profit"
+                elif current_price <= sl:
+                    exit_reason = "stop_loss"
+            else:  # short
+                if current_price <= tp:
+                    exit_reason = "take_profit"
+                elif current_price >= sl:
+                    exit_reason = "stop_loss"
+            if not exit_reason:
+                continue
+
+            # Cooldown — don't stack duplicate closes while a prior one is working.
+            if now_ts - self._stock_exit_attempts.get(sym, 0.0) < 120:
+                continue
+            if self.cfg.dry_run:
+                continue
+
+            try:
+                close_side = "sell" if direction == "buy" else "buy"
+                qty = abs(float(p.qty))
+                coid = f"mr-sx-{tp_sl['score_id']}-{int(now_ts * 1000)}"
+                if market_open:
+                    self.alpaca.submit_simple_order(
+                        symbol=p.symbol, side=close_side, qty=qty,
+                        order_type="market", time_in_force="day",
+                        client_order_id=coid,
+                    )
+                else:
+                    cbuf = 0.997 if close_side == "sell" else 1.003
+                    self.alpaca.submit_simple_order(
+                        symbol=p.symbol, side=close_side, qty=qty,
+                        order_type="limit", limit_price=round(current_price * cbuf, 2),
+                        time_in_force="day", extended_hours=True,
+                        client_order_id=coid,
+                    )
+                self._stock_exit_attempts[sym] = now_ts
+                entry = float(p.avg_entry_price)
+                pnl = ((current_price - entry) if direction == "buy"
+                       else (entry - current_price)) * qty
+                log.info(
+                    "STOCK-EXT EXIT [%s] %s %s qty=%g @ $%.2f (SL=$%.2f TP=$%.2f) pnl~$%.2f",
+                    exit_reason, p.symbol, close_side, qty, current_price, sl, tp, pnl,
+                )
+                with get_connection() as conn:
+                    self._update_daily_pnl(conn, pnl)
+                try:
+                    from ..notifications.realtime import TradeAlert, notify_trade
+                    notify_trade(TradeAlert(
+                        kind="FILLED", symbol=p.symbol, pnl_usd=pnl,
+                        notional_usd=abs(float(p.market_value)),
+                        qty=qty, extra=f"ext_{exit_reason}",
+                    ))
+                except Exception:  # noqa: BLE001
+                    pass
+            except AlpacaError as exc:
+                log.error("STOCK-EXT EXIT submit failed for %s: %s", p.symbol, exc)
 
     def _poll_crypto_exits(self, positions) -> None:
         """Poll open CRYPTO positions and close at SL/TP from bot_decisions.

@@ -2,6 +2,7 @@
 from .alpaca_news import AlpacaNewsIngestor
 from .base import Ingestor, ParsedSignal, PollResult, TickerMention
 from .halts import NasdaqHaltsIngestor
+from .market_movers import MarketMoversIngestor
 from .reddit_public import RedditPublicIngestor
 from .rss_news import RssNewsIngestor
 from .sec_edgar import SecEdgarIngestor
@@ -19,6 +20,7 @@ __all__ = [
     "StockTwitsTrendingIngestor",
     "AlpacaNewsIngestor",
     "NasdaqHaltsIngestor",
+    "MarketMoversIngestor",
     "TickerExtractor",
     "TICKER_EXTRACTOR",
 ]

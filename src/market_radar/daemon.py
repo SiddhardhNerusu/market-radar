@@ -62,6 +62,7 @@ DEFAULTS = {
     "rss_news_seconds":    3 * 60,
     "alpaca_news_seconds": 60,          # market-wide catalyst firehose — time-sensitive
     "halts_seconds":       60,          # Nasdaq trading-halt feed — real-time bang detector
+    "movers_seconds":      120,         # market-wide top-gainers/most-active — bang scanner
     "reddit_seconds":      3 * 60,
     "stocktwits_seconds":  2 * 60,
     "earnings_calendar_seconds": 12 * 60 * 60,  # twice a day — Finnhub free tier
@@ -133,6 +134,15 @@ def _job_halts() -> None:
     regulatory halts). Public feed, no credentials needed."""
     from .ingestors.halts import NasdaqHaltsIngestor
     NasdaqHaltsIngestor().poll()
+
+def _job_movers() -> None:
+    """Market-wide top-gainers + most-active scanner — catches the micro-cap bangs
+    the ~85-name price-action scanner is blind to (INHD +1897% etc.). No-ops
+    cleanly when Alpaca creds are missing."""
+    if not (CONFIG.alpaca_api_key and CONFIG.alpaca_api_secret):
+        return
+    from .ingestors.market_movers import MarketMoversIngestor
+    MarketMoversIngestor().poll()
 
 def _job_earnings_calendar() -> None:
     """Pull next 30 days of US earnings from Finnhub. Runs twice daily."""
@@ -250,6 +260,7 @@ def build_scheduler() -> BackgroundScheduler:
         ("rss_news",       _job_rss_news,       DEFAULTS["rss_news_seconds"]),
         ("alpaca_news",    _job_alpaca_news,    DEFAULTS["alpaca_news_seconds"]),
         ("halts",          _job_halts,          DEFAULTS["halts_seconds"]),
+        ("movers",         _job_movers,         DEFAULTS["movers_seconds"]),
         ("reddit",         _job_reddit,         DEFAULTS["reddit_seconds"]),
         ("stocktwits",     _job_stocktwits,     DEFAULTS["stocktwits_seconds"]),
         ("earnings_cal",   _job_earnings_calendar, DEFAULTS["earnings_calendar_seconds"]),

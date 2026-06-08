@@ -14,6 +14,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
     # Tier 1 — factual, verified
     "sec_edgar": 9.5,
     "nasdaq_halts": 8.0,   # exchange trading-halt feed — authoritative, real-time
+    "market_movers": 7.0,  # Alpaca market-wide gainers/most-active — bang scanner
 
     # Tier 2 — mainstream financial news
     "bloomberg_google": 8.5,

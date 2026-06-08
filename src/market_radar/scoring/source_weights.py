@@ -13,6 +13,7 @@ from __future__ import annotations
 SOURCE_WEIGHTS: dict[str, float] = {
     # Tier 1 — factual, verified
     "sec_edgar": 9.5,
+    "nasdaq_halts": 8.0,   # exchange trading-halt feed — authoritative, real-time
 
     # Tier 2 — mainstream financial news
     "bloomberg_google": 8.5,

@@ -1,6 +1,7 @@
 """Tiered signal ingestors. Each module exports an Ingestor subclass."""
 from .alpaca_news import AlpacaNewsIngestor
 from .base import Ingestor, ParsedSignal, PollResult, TickerMention
+from .halts import NasdaqHaltsIngestor
 from .reddit_public import RedditPublicIngestor
 from .rss_news import RssNewsIngestor
 from .sec_edgar import SecEdgarIngestor
@@ -17,6 +18,7 @@ __all__ = [
     "RedditPublicIngestor",
     "StockTwitsTrendingIngestor",
     "AlpacaNewsIngestor",
+    "NasdaqHaltsIngestor",
     "TickerExtractor",
     "TICKER_EXTRACTOR",
 ]

@@ -61,6 +61,7 @@ DEFAULTS = {
     "sec_edgar_seconds":   5 * 60,
     "rss_news_seconds":    3 * 60,
     "alpaca_news_seconds": 60,          # market-wide catalyst firehose — time-sensitive
+    "halts_seconds":       60,          # Nasdaq trading-halt feed — real-time bang detector
     "reddit_seconds":      3 * 60,
     "stocktwits_seconds":  2 * 60,
     "earnings_calendar_seconds": 12 * 60 * 60,  # twice a day — Finnhub free tier
@@ -125,6 +126,13 @@ def _job_reddit() -> None:
 
 def _job_stocktwits() -> None:
     StockTwitsTrendingIngestor().poll()
+
+def _job_halts() -> None:
+    """Pull the Nasdaq Trader trading-halt feed — the real-time 'this stock is
+    banging right now' detector (LULD volatility halts on micro-caps, plus news +
+    regulatory halts). Public feed, no credentials needed."""
+    from .ingestors.halts import NasdaqHaltsIngestor
+    NasdaqHaltsIngestor().poll()
 
 def _job_earnings_calendar() -> None:
     """Pull next 30 days of US earnings from Finnhub. Runs twice daily."""
@@ -241,6 +249,7 @@ def build_scheduler() -> BackgroundScheduler:
         ("sec_edgar",      _job_sec_edgar,      DEFAULTS["sec_edgar_seconds"]),
         ("rss_news",       _job_rss_news,       DEFAULTS["rss_news_seconds"]),
         ("alpaca_news",    _job_alpaca_news,    DEFAULTS["alpaca_news_seconds"]),
+        ("halts",          _job_halts,          DEFAULTS["halts_seconds"]),
         ("reddit",         _job_reddit,         DEFAULTS["reddit_seconds"]),
         ("stocktwits",     _job_stocktwits,     DEFAULTS["stocktwits_seconds"]),
         ("earnings_cal",   _job_earnings_calendar, DEFAULTS["earnings_calendar_seconds"]),

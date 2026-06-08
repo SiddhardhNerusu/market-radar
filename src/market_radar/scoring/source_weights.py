@@ -22,6 +22,7 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "reuters_world_google": 8.0,
     "wsj_google": 8.0,
     "alpaca_news": 7.5,
+    "globenewswire_newsroom": 6.5,   # direct PR wire — micro-cap/biotech catalysts
     "marketwatch_topstories": 7.5,
     "marketwatch_realtime": 7.5,
     "marketwatch_marketpulse": 7.5,

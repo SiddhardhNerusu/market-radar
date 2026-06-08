@@ -39,6 +39,16 @@ class FeedSpec:
 
 # Tier 2 feed registry — order doesn't matter, dedup is per (source, external_id).
 FEEDS: list[FeedSpec] = [
+    # GlobeNewswire — direct press-release wire, heavily used by micro-cap and
+    # biotech names for catalyst PRs (FDA actions, deals, contract wins). Additive
+    # to the Alpaca/Benzinga firehose; per-(source,external_id) dedup absorbs any
+    # overlap. Tickers are extracted from the headline/body. Verified live 2026-06-08.
+    FeedSpec(
+        source_id="globenewswire_newsroom",
+        url="https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire-News-Room",
+        label="GlobeNewswire — News Room",
+        source_weight=6.5,
+    ),
     # MarketWatch
     FeedSpec(
         source_id="marketwatch_topstories",

@@ -847,7 +847,7 @@ class LiveTrader:
         # Step 2b.7: poll & exit EXTENDED-HOURS stock positions at SL/TP. These were
         # entered as simple limit orders (no server-side bracket), so this poller is
         # their only stop/TP. Regular-hours bracket stocks are untouched (filtered by
-        # outcome_detail='stock_ext_polled').
+        # outcome_detail='stock_polled').
         try:
             self._poll_stock_exits(positions)
         except Exception as exc:  # noqa: BLE001
@@ -2227,17 +2227,20 @@ class LiveTrader:
                     )
                     placed_id = simple.id
                     placed_qty = sized.qty
-                    placed_kind = "stock_ext_polled"
+                    placed_kind = "stock_polled"
                 else:
-                    bracket = self.alpaca.submit_bracket_order(
+                    # RTH catalyst entry is ALSO poll-managed (plain market order) so the
+                    # trailing take-profit in _poll_stock_exits applies — no fixed-TP bracket
+                    # that would cap a volatile "bang". Hard SL + trailing TP live in the
+                    # poller (the only stop), so the bot must stay alive (always-on).
+                    simple = self.alpaca.submit_simple_order(
                         symbol=symbol, side=direction, qty=sized.qty,
-                        take_profit=sized.take_profit, stop_loss=sized.stop_loss,
-                        time_in_force="day",
+                        order_type="market", time_in_force="day",
                         client_order_id=client_order_id,
                     )
-                    placed_id = bracket.parent.id
+                    placed_id = simple.id
                     placed_qty = sized.qty
-                    placed_kind = "bracket_submitted"
+                    placed_kind = "stock_polled"
         except AlpacaError as exc:
             with get_connection() as conn:
                 conn.execute(
@@ -2421,7 +2424,7 @@ class LiveTrader:
         """Poll EXTENDED-HOURS stock positions and close them at their recorded SL/TP.
 
         These were entered by _process_stock_candidate as simple LIMIT orders
-        (outcome_detail='stock_ext_polled') because Alpaca forbids bracket/stop/market
+        (outcome_detail='stock_polled') because Alpaca forbids bracket/stop/market
         orders outside regular hours — so they have NO server-side bracket and THIS
         poller is their only stop/TP protection. Regular-hours bracket stocks are
         protected by Alpaca server-side and are NOT touched here (the query filters
@@ -2440,7 +2443,7 @@ class LiveTrader:
                 """
                 SELECT ticker, direction, stop_loss, take_profit, score_id
                 FROM bot_decisions
-                WHERE outcome='placed' AND outcome_detail='stock_ext_polled'
+                WHERE outcome='placed' AND outcome_detail='stock_polled'
                   AND ticker NOT LIKE '%/%'
                   AND stop_loss IS NOT NULL AND take_profit IS NOT NULL
                 ORDER BY id DESC
@@ -2466,6 +2469,12 @@ class LiveTrader:
                                 (td["score_id"],),
                             )
                     self._stock_exit_attempts.pop(sym, None)
+        # Drop trailing-peak state for any ticker no longer open, so a later re-entry
+        # on the same name starts its peak fresh from entry (not a stale prior high).
+        if hasattr(self, "_stock_peaks"):
+            for pk in list(self._stock_peaks.keys()):
+                if pk[0] not in open_syms:
+                    self._stock_peaks.pop(pk, None)
 
         if not sl_tp_by_sym or not stock_positions:
             return
@@ -2487,20 +2496,39 @@ class LiveTrader:
                     continue
                 current_price = float(latest)
             sl = float(tp_sl["stop_loss"])
-            tp = float(tp_sl["take_profit"])
             direction = tp_sl["direction"]
+            entry = float(p.avg_entry_price)
+
+            # FLEXIBLE / TRAILING TAKE-PROFIT — catalyst "bangs" are volatile, so RIDE the
+            # run instead of capping it with a fixed TP. Ratchet the peak; once up
+            # TRAIL_ARM_PCT from entry the trail is active, and we exit when price gives back
+            # TRAIL_GIVEBACK_PCT from that peak (banking the gain). Before the trail rises
+            # above entry, the hard ATR stop_loss (from sizing) caps the downside. Both are
+            # env-tunable so they can be tightened/loosened for how volatile the names run.
+            TRAIL_ARM_PCT = float(os.getenv("LIVE_STOCK_TRAIL_ARM_PCT", "0.05"))
+            TRAIL_GIVEBACK_PCT = float(os.getenv("LIVE_STOCK_TRAIL_GIVEBACK_PCT", "0.15"))
+            if not hasattr(self, "_stock_peaks"):
+                self._stock_peaks = {}
+            peak_key = (sym, direction)
+            prev_peak = self._stock_peaks.get(peak_key, entry)
 
             exit_reason = None
             if direction == "buy":
-                if current_price >= tp:
-                    exit_reason = "take_profit"
-                elif current_price <= sl:
-                    exit_reason = "stop_loss"
+                peak = max(prev_peak, current_price)
+                gain_pct = (peak - entry) / entry if entry else 0.0
+                trail_armed = gain_pct >= TRAIL_ARM_PCT
+                effective_sl = max(sl, peak * (1 - TRAIL_GIVEBACK_PCT)) if trail_armed else sl
+                if current_price <= effective_sl:
+                    exit_reason = "trail_take_profit" if effective_sl > entry else "stop_loss"
             else:  # short
-                if current_price <= tp:
-                    exit_reason = "take_profit"
-                elif current_price >= sl:
-                    exit_reason = "stop_loss"
+                peak = min(prev_peak, current_price)
+                gain_pct = (entry - peak) / entry if entry else 0.0
+                trail_armed = gain_pct >= TRAIL_ARM_PCT
+                effective_sl = min(sl, peak * (1 + TRAIL_GIVEBACK_PCT)) if trail_armed else sl
+                if current_price >= effective_sl:
+                    exit_reason = "trail_take_profit" if effective_sl < entry else "stop_loss"
+            self._stock_peaks[peak_key] = peak
+
             if not exit_reason:
                 continue
 
@@ -2533,8 +2561,8 @@ class LiveTrader:
                 pnl = ((current_price - entry) if direction == "buy"
                        else (entry - current_price)) * qty
                 log.info(
-                    "STOCK-EXT EXIT [%s] %s %s qty=%g @ $%.2f (SL=$%.2f TP=$%.2f) pnl~$%.2f",
-                    exit_reason, p.symbol, close_side, qty, current_price, sl, tp, pnl,
+                    "STOCK EXIT [%s] %s %s qty=%g @ $%.2f (peak=$%.2f exitSL=$%.2f) pnl~$%.2f",
+                    exit_reason, p.symbol, close_side, qty, current_price, peak, effective_sl, pnl,
                 )
                 with get_connection() as conn:
                     self._update_daily_pnl(conn, pnl)

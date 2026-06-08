@@ -60,7 +60,7 @@ log = logging.getLogger("marketradar.daemon")
 DEFAULTS = {
     "sec_edgar_seconds":   5 * 60,
     "rss_news_seconds":    3 * 60,
-    "alpaca_news_seconds": 60,          # market-wide catalyst firehose — time-sensitive
+    "alpaca_news_seconds": 30,          # catalyst firehose — tightened 60->30 for latency
     "halts_seconds":       60,          # Nasdaq trading-halt feed — real-time bang detector
     "movers_seconds":      120,         # market-wide top-gainers/most-active — bang scanner
     "reddit_seconds":      3 * 60,
@@ -72,7 +72,7 @@ DEFAULTS = {
     "outcome_update_seconds": 60 * 60,
     "notify_seconds":      30,
     "ml_predict_seconds":  60,
-    "llm_classify_seconds": 90,
+    "llm_classify_seconds": 45,         # tightened 90->45 — LLM classify is on the catalyst critical path
     "price_action_seconds": 60,
 }
 
@@ -262,7 +262,11 @@ def build_scheduler() -> BackgroundScheduler:
         ("halts",          _job_halts,          DEFAULTS["halts_seconds"]),
         ("movers",         _job_movers,         DEFAULTS["movers_seconds"]),
         ("reddit",         _job_reddit,         DEFAULTS["reddit_seconds"]),
-        ("stocktwits",     _job_stocktwits,     DEFAULTS["stocktwits_seconds"]),
+        # DISABLED 2026-06-08: StockTwits is Tier 3 — 0 trades ever, measured negative
+        # edge, and EXCLUDED from corroboration (only Tier 1/2 count). It was ~44% of
+        # scoring volume, backing up the queue for zero trading benefit. Verified safe
+        # to cut. Re-enable by uncommenting this single line.
+        # ("stocktwits",     _job_stocktwits,     DEFAULTS["stocktwits_seconds"]),
         ("earnings_cal",   _job_earnings_calendar, DEFAULTS["earnings_calendar_seconds"]),
         ("t212_snapshot",  _job_t212_snap,      DEFAULTS["t212_snap_seconds"]),
         ("score",          _job_score,          DEFAULTS["scoring_seconds"]),

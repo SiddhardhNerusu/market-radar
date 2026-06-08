@@ -90,7 +90,10 @@ def score_pending(
             JOIN signal_tickers st ON st.signal_id = rs.id
             LEFT JOIN signal_scores ss ON ss.signal_id = rs.id AND ss.ticker = st.ticker
             WHERE ss.id IS NULL
-            ORDER BY rs.id ASC
+            -- PRIORITY: score Tier 1/2 catalysts (SEC, wires, halts, movers) BEFORE
+            -- Tier 3 social, so a fresh catalyst is never stuck behind a social-chatter
+            -- backlog. FIFO within a tier (rs.id ASC) so nothing starves.
+            ORDER BY rs.source_tier ASC, rs.id ASC
             LIMIT ?
             """,
             (batch_limit,),

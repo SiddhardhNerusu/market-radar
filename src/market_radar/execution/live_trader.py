@@ -31,6 +31,7 @@ still trigger.
 from __future__ import annotations
 
 import logging
+import os
 import signal as _signal
 import time
 from dataclasses import dataclass, field
@@ -1412,6 +1413,21 @@ class LiveTrader:
         # signals trade as stock. (PA-momentum-into-options drew the day's loss.)
         # A catalyst whose spread is unbuildable falls back to stock.
         is_crypto_sym = "/" in symbol
+
+        # CATALYST-ONLY mode (LIVE_CATALYST_ONLY=1): the news-catalyst radar IS the
+        # edge. Reject price-action-scanner and model-only entries so the bot acts
+        # ONLY on qualifying news catalysts. Crypto trades its own path, untouched.
+        if (os.getenv("LIVE_CATALYST_ONLY", "0").strip().lower() in {"1", "true", "yes", "on"}
+                and not is_crypto_sym
+                and not self._is_news_catalyst(cand)):
+            self._persist_decision(
+                cand, gate_passed=False,
+                gate_reason="catalyst_only: not a qualifying news catalyst",
+                risk_passed=False, risk_reason="n/a",
+                outcome="gate_blocked", outcome_detail="catalyst_only",
+            )
+            return
+
         if (self.cfg.options_enabled
                 and self.options is not None
                 and not is_crypto_sym

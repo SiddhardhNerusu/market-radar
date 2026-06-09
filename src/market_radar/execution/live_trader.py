@@ -844,6 +844,14 @@ class LiveTrader:
         except Exception as exc:  # noqa: BLE001
             log.exception("Crypto exit poll failed: %s", exc)
 
+        # Step 2b.65: reconcile EXTENDED-HOURS entry FILLS — only count orders that
+        # actually filled. Unfilled limit orders are retried (if high-priority) or
+        # marked 'unfilled', so the bot never treats an unfilled order as a position.
+        try:
+            self._reconcile_stock_fills(positions)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Stock fill reconcile failed: %s", exc)
+
         # Step 2b.7: poll & exit EXTENDED-HOURS stock positions at SL/TP. These were
         # entered as simple limit orders (no server-side bracket), so this poller is
         # their only stop/TP. Regular-hours bracket stocks are untouched (filtered by
@@ -2419,6 +2427,125 @@ class LiveTrader:
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("_book_crypto_exit_pnl(%s) failed: %s", pair, exc)
+
+    def _reconcile_stock_fills(self, positions) -> None:
+        """Only treat ACTUALLY-FILLED ext-hours entries as positions.
+
+        An ext-hours entry is a LIMIT order that may not fill in thin liquidity. We
+        used to leave it 'placed' forever (phantom). Here, for each 'placed'
+        stock_polled decision with NO matching open position, check the real order:
+          - filled                       -> leave (position syncs next snapshot)
+          - still working + HIGH PRIORITY -> cancel + re-submit a fresh marketable
+                                            order to CHASE the fill (bounded: never
+                                            chase >5% past the entry estimate)
+          - still working + low priority  -> cancel + mark 'unfilled'
+          - canceled/expired/rejected     -> mark 'unfilled'
+        'unfilled' is terminal and is never counted as a position again.
+        """
+        import time as _t_fill
+        open_syms = {p.symbol.upper() for p in positions
+                     if "/" not in p.symbol and len(p.symbol) <= 9}
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, score_id, ticker, direction, qty, composite_score,
+                       entry_estimate, alpaca_order_id
+                FROM bot_decisions
+                WHERE outcome='placed' AND outcome_detail='stock_polled'
+                  AND alpaca_order_id IS NOT NULL
+                """
+            ).fetchall()
+        if not rows:
+            return
+        if not hasattr(self, "_stock_fill_retries"):
+            self._stock_fill_retries = {}
+        market_open = self.alpaca.is_market_open()
+        RETRY_COMPOSITE = float(os.getenv("LIVE_STOCK_FILL_RETRY_COMPOSITE", "7.0"))
+        MAX_RETRIES = int(os.getenv("LIVE_STOCK_FILL_MAX_RETRIES", "3"))
+        MAX_CHASE_PCT = 0.05  # never chase a fill more than 5% past the entry estimate
+
+        for r in rows:
+            sym = r["ticker"].upper()
+            if sym in open_syms:
+                continue  # actually filled and held — nothing to reconcile
+            if sym in getattr(self, "_stock_exit_attempts", {}):
+                continue  # an exit we already fired — handled by the exit poller cleanup
+            try:
+                o = self.alpaca.get_order(r["alpaca_order_id"])
+            except AlpacaError:
+                continue
+            st = (o.status or "").lower()
+            score_id = r["score_id"]
+
+            if st == "filled":
+                continue  # filled; the position will appear on the next snapshot
+
+            dead = st in ("canceled", "cancelled", "expired", "rejected",
+                          "done_for_day", "suspended", "stopped")
+            working = st in ("new", "accepted", "partially_filled", "pending_new",
+                             "accepted_for_bidding", "held", "pending_replace")
+
+            if dead:
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE bot_decisions SET outcome='unfilled', "
+                        "outcome_detail='ext_no_fill' WHERE id=?", (r["id"],))
+                self._stock_fill_retries.pop(score_id, None)
+                log.info("[fill-reconcile] %s order %s — not filled, marked unfilled", sym, st)
+                continue
+            if not working:
+                continue  # unknown status — re-check next loop
+
+            comp = float(r["composite_score"] or 0)
+            retries = self._stock_fill_retries.get(score_id, 0)
+            qty = abs(float(r["qty"] or 0))
+            entry_est = float(r["entry_estimate"] or 0)
+            direction = r["direction"]
+            cur = self.alpaca.get_latest_trade(sym)
+            want_retry = comp >= RETRY_COMPOSITE and retries < MAX_RETRIES and qty > 0 and bool(cur)
+            if want_retry and entry_est > 0 and cur:
+                chase = ((float(cur) - entry_est) / entry_est if direction == "buy"
+                         else (entry_est - float(cur)) / entry_est)
+                if chase > MAX_CHASE_PCT:
+                    want_retry = False  # moved too far against us — don't chase a runaway
+
+            try:
+                self.alpaca.cancel_order(r["alpaca_order_id"])
+            except AlpacaError:
+                pass
+
+            if want_retry:
+                coid = f"mr-refill-{score_id}-{int(_t_fill.time() * 1000)}"
+                try:
+                    if market_open:
+                        new = self.alpaca.submit_simple_order(
+                            symbol=sym, side=direction, qty=qty,
+                            order_type="market", time_in_force="day", client_order_id=coid)
+                    else:
+                        buf = 1.005 if direction == "buy" else 0.995
+                        new = self.alpaca.submit_simple_order(
+                            symbol=sym, side=direction, qty=qty,
+                            order_type="limit", limit_price=round(float(cur) * buf, 2),
+                            time_in_force="day", extended_hours=True, client_order_id=coid)
+                    self._stock_fill_retries[score_id] = retries + 1
+                    with get_connection() as conn:
+                        conn.execute("UPDATE bot_decisions SET alpaca_order_id=? WHERE id=?",
+                                     (new.id, r["id"]))
+                    log.info("[fill-retry %d/%d] %s comp=%.1f — re-submitted to chase the fill",
+                             retries + 1, MAX_RETRIES, sym, comp)
+                except AlpacaError as exc:
+                    log.warning("[fill-retry] %s re-submit failed: %s", sym, exc)
+                    with get_connection() as conn:
+                        conn.execute("UPDATE bot_decisions SET outcome='unfilled', "
+                                     "outcome_detail='ext_no_fill' WHERE id=?", (r["id"],))
+            else:
+                with get_connection() as conn:
+                    conn.execute(
+                        "UPDATE bot_decisions SET outcome='unfilled', "
+                        "outcome_detail='ext_no_fill' WHERE id=?", (r["id"],))
+                self._stock_fill_retries.pop(score_id, None)
+                log.info("[fill-reconcile] %s not filled (comp=%.1f retries=%d) — cancelled + unfilled",
+                         sym, comp, retries)
 
     def _poll_stock_exits(self, positions) -> None:
         """Poll EXTENDED-HOURS stock positions and close them at their recorded SL/TP.

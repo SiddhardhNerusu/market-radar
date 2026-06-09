@@ -2666,6 +2666,17 @@ class LiveTrader:
             for pk in list(self._stock_peaks.keys()):
                 if pk[0] not in open_syms:
                     self._stock_peaks.pop(pk, None)
+        # Cancel + forget any server-side trailing_stop whose position is gone (it
+        # already fired, or the position closed another way — cancel is a harmless
+        # no-op if already filled/canceled; this prevents an orphan stop lingering).
+        if hasattr(self, "_stock_trailstops"):
+            for s in list(self._stock_trailstops.keys()):
+                if s not in open_syms:
+                    try:
+                        self.alpaca.cancel_order(self._stock_trailstops[s])
+                    except AlpacaError:
+                        pass
+                    self._stock_trailstops.pop(s, None)
 
         if not sl_tp_by_sym or not stock_positions:
             return
@@ -2689,6 +2700,45 @@ class LiveTrader:
             sl = float(tp_sl["stop_loss"])
             direction = tp_sl["direction"]
             entry = float(p.avg_entry_price)
+
+            # SERVER-SIDE protection (regular hours): arm a native trailing_stop ONCE,
+            # broker-side, so a crash or a sleeping Mac can't leave a catalyst "bang"
+            # unmanaged. It rides the run and exits on the same giveback % the poller
+            # uses — but survives the bot dying. Once armed, the broker order OWNS the
+            # exit and the poller hands off (no double-close). Extended hours can't use
+            # server stops, so the poller keeps managing those itself (below).
+            if not hasattr(self, "_stock_trailstops"):
+                self._stock_trailstops = {}
+            if market_open and sym not in self._stock_trailstops:
+                existing_id = None
+                try:  # adopt an existing trailing_stop (e.g. after a bot restart) — no dupes
+                    for o in self.alpaca.list_orders(status="open", limit=200):
+                        if o.symbol.upper() == sym and "trailing" in (o.order_type or "").lower():
+                            existing_id = o.id
+                            break
+                except AlpacaError:
+                    pass
+                if existing_id:
+                    self._stock_trailstops[sym] = existing_id
+                else:
+                    try:
+                        giveback = float(os.getenv("LIVE_STOCK_TRAIL_GIVEBACK_PCT", "0.15"))
+                        ts = self.alpaca.submit_trailing_stop_order(
+                            symbol=p.symbol,
+                            side=("sell" if direction == "buy" else "buy"),
+                            qty=abs(float(p.qty)),
+                            trail_percent=round(giveback * 100, 2),
+                            time_in_force="gtc",
+                            client_order_id=f"mr-ts-{tp_sl['score_id']}-{int(now_ts)}",
+                        )
+                        self._stock_trailstops[sym] = ts.id
+                        log.info("[server-stop] %s armed trailing_stop %.1f%% broker-side — "
+                                 "poller hands off RTH exit", sym, giveback * 100)
+                    except AlpacaError as exc:
+                        log.warning("[server-stop] %s arm failed (poller still manages): %s",
+                                    sym, exc)
+            if market_open and sym in self._stock_trailstops:
+                continue  # broker-side trailing_stop owns this RTH exit
 
             # FLEXIBLE / TRAILING TAKE-PROFIT — catalyst "bangs" are volatile, so RIDE the
             # run instead of capping it with a fixed TP. Ratchet the peak; once up

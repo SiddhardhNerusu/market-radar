@@ -564,6 +564,38 @@ class AlpacaClient:
         d = self._request("POST", "/v2/orders", json=payload)
         return _to_order(d)
 
+    def submit_trailing_stop_order(
+        self,
+        *,
+        symbol: str,
+        side: OrderSide,
+        qty: float,
+        trail_percent: float,
+        time_in_force: TimeInForce = "gtc",
+        client_order_id: Optional[str] = None,
+    ) -> Order:
+        """Submit a server-side TRAILING STOP — rides the high-water mark and fires a
+        market exit when price retraces ``trail_percent`` (e.g. 15.0 = 15%) from the
+        peak. This protects a poll-managed catalyst position BROKER-SIDE, so a crash
+        or a sleeping Mac can't leave a 'bang' unmanaged (the in-process poller is no
+        longer the only stop). Regular-hours equities only — Alpaca won't trigger
+        market-type orders in extended hours."""
+        if qty <= 0:
+            raise AlpacaError(f"qty must be > 0, got {qty}")
+        if trail_percent <= 0:
+            raise AlpacaError(f"trail_percent must be > 0, got {trail_percent}")
+        payload: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "qty": str(qty),
+            "type": "trailing_stop",
+            "trail_percent": str(trail_percent),
+            "time_in_force": time_in_force,
+            "client_order_id": client_order_id or f"mr-ts-{uuid.uuid4().hex[:18]}",
+        }
+        d = self._request("POST", "/v2/orders", json=payload)
+        return _to_order(d)
+
     def submit_bracket_order(
         self,
         *,

@@ -410,7 +410,7 @@ def _corroboration_count(
           AND rs.id != ?
           AND rs.source_tier IN (1, 2)
           AND COALESCE(rs.published_at, rs.ingested_at) >=
-              datetime('now', '-{int(window_hours)} hours')
+              strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', '-{int(window_hours)} hours'))
     """
     row = conn.execute(sql, (ticker, exclude_signal_id)).fetchone()
     return int((row["n"] if row else 0) or 0)

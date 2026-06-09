@@ -392,7 +392,7 @@ class RiskManager:
             with get_connection() as conn:
                 peak_row = conn.execute(
                     "SELECT MAX(equity_usd) AS peak FROM bot_account_snapshots "
-                    "WHERE snapshot_at > datetime('now','-30 days')"
+                    "WHERE snapshot_at > strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now','-30 days'))"
                 ).fetchone()
                 cur_row = conn.execute(
                     "SELECT equity_usd FROM bot_account_snapshots "
@@ -420,7 +420,7 @@ class RiskManager:
                     """
                     SELECT COUNT(*) AS n FROM bot_decisions
                     WHERE outcome = 'placed'
-                      AND decided_at >= datetime('now', 'start of day')
+                      AND decided_at >= strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', 'start of day'))
                     """
                 ).fetchone()
                 return int(row[0]) if row else 0

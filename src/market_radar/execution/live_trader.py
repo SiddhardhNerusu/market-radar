@@ -2978,7 +2978,7 @@ class LiveTrader:
                     WHERE ss.ticker = ?
                       AND rs.source LIKE 'price_action_%'
                       AND ss.composite_score >= 7.5
-                      AND ss.scored_at > datetime('now','-5 minutes')
+                      AND ss.scored_at > strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now','-5 minutes'))
                       AND ((? > 0 AND ss.sentiment >= 0.7)
                            OR (? < 0 AND ss.sentiment <= -0.7))
                     ORDER BY ss.scored_at DESC LIMIT 1
@@ -2995,7 +2995,7 @@ class LiveTrader:
                     WHERE ss.ticker = ?
                       AND rs.source LIKE 'price_action_%'
                       AND ss.composite_score >= 6.5
-                      AND ss.scored_at > datetime('now','-5 minutes')
+                      AND ss.scored_at > strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now','-5 minutes'))
                       AND ((? > 0 AND ss.sentiment <= -0.3)
                            OR (? < 0 AND ss.sentiment >= 0.3))
                     LIMIT 1
@@ -4296,7 +4296,7 @@ class LiveTrader:
                     WHERE UPPER(bo.ticker) IN (?, ?)
                       AND ss.event_type = ?
                       AND bo.realized_pnl_usd IS NOT NULL
-                      AND bo.filled_at > datetime('now','-30 days')
+                      AND bo.filled_at > strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now','-30 days'))
                     """,
                     (ticker.upper(),
                      ticker.replace("/", "").upper(),  # crypto BTC/USD vs BTCUSD
@@ -4314,7 +4314,7 @@ class LiveTrader:
                     WHERE UPPER(sp.underlying) = ?
                       AND ss.event_type = ?
                       AND sp.realized_pnl_usd IS NOT NULL
-                      AND sp.closed_at > datetime('now','-30 days')
+                      AND sp.closed_at > strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now','-30 days'))
                     """,
                     (ticker.upper(), event_type),
                 ).fetchone()

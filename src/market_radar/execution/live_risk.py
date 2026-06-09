@@ -103,7 +103,7 @@ class LiveRiskManager(RiskManager):
                 n += int(conn.execute(
                     "SELECT COUNT(*) FROM bot_option_decisions "
                     "WHERE outcome='placed' "
-                    "AND decided_at >= datetime('now','start of day')"
+                    "AND decided_at >= strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now','start of day'))"
                 ).fetchone()[0])
         except Exception as exc:  # noqa: BLE001 — options table optional
             log.debug("option entry count failed (using base only): %s", exc)

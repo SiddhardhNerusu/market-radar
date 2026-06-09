@@ -243,7 +243,7 @@ def classify_pending(*, batch_size: int = 50,
                    ON lc.signal_id = ss.signal_id AND lc.ticker = ss.ticker
             WHERE lc.id IS NULL
               AND rs.source NOT LIKE 'sec_edgar_backfill_%'
-              AND rs.ingested_at >= datetime('now', '-2 days')
+              AND rs.ingested_at >= strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', '-2 days'))
             ORDER BY ss.composite_score DESC, ss.id DESC
             LIMIT ?
             """,

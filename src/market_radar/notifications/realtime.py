@@ -202,7 +202,7 @@ class Notifier:
             with get_connection() as conn:
                 row = conn.execute(
                     "SELECT COUNT(*) FROM notifications_sent "
-                    "WHERE sent_at >= datetime('now','start of day')"
+                    "WHERE sent_at >= strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now','start of day'))"
                 ).fetchone()
             return int(row[0]) if row else 0
         except Exception as exc:  # noqa: BLE001

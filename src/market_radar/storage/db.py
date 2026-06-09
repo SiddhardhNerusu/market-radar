@@ -54,6 +54,11 @@ def _connect(path: Path) -> sqlite3.Connection:
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA busy_timeout = 10000;")
         conn.execute("PRAGMA foreign_keys = ON;")
+        # Bound WAL growth. With ~15 interval jobs each opening connections, a
+        # continuous reader presence can starve auto-checkpoints and let the -wal
+        # file grow without bound — a cause of progressively slower queries and the
+        # observed contention/hangs. Checkpoint every ~1000 pages.
+        conn.execute("PRAGMA wal_autocheckpoint = 1000;")
     except sqlite3.OperationalError:
         pass
     return conn

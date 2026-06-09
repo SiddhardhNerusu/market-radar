@@ -30,7 +30,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -82,6 +82,21 @@ DEFAULTS = {
 _PA_SCANNER = None
 
 
+# Cache ingestor instances so their requests.Session (and TCP connection pool)
+# persists across polls. Re-creating an ingestor every interval tick opened a
+# fresh Session each time — the likely cause of the prior file-descriptor
+# exhaustion. Lazily built so missing creds never break daemon load.
+_INGESTORS: dict = {}
+
+
+def _cached(key: str, factory):
+    inst = _INGESTORS.get(key)
+    if inst is None:
+        inst = factory()
+        _INGESTORS[key] = inst
+    return inst
+
+
 # ---------------------------------------------------------------------------
 # Job wrappers
 # ---------------------------------------------------------------------------
@@ -101,10 +116,10 @@ def _safe(name: str, fn):
 
 
 def _job_sec_edgar() -> None:
-    SecEdgarIngestor().poll()
+    _cached("sec_edgar", SecEdgarIngestor).poll()
 
 def _job_rss_news() -> None:
-    RssNewsIngestor().poll()
+    _cached("rss_news", RssNewsIngestor).poll()
 
 def _job_alpaca_news() -> None:
     """Pull the market-wide Alpaca/Benzinga news firehose (every ticker).
@@ -115,7 +130,7 @@ def _job_alpaca_news() -> None:
     if not (CONFIG.alpaca_api_key and CONFIG.alpaca_api_secret):
         return
     from .ingestors.alpaca_news import AlpacaNewsIngestor
-    AlpacaNewsIngestor().poll()
+    _cached("alpaca_news", AlpacaNewsIngestor).poll()
 
 def _job_reddit() -> None:
     # Disabled 2026-05-29: Reddit public JSON returns 6,930 HTTP 403s/day
@@ -133,7 +148,7 @@ def _job_halts() -> None:
     banging right now' detector (LULD volatility halts on micro-caps, plus news +
     regulatory halts). Public feed, no credentials needed."""
     from .ingestors.halts import NasdaqHaltsIngestor
-    NasdaqHaltsIngestor().poll()
+    _cached("halts", NasdaqHaltsIngestor).poll()
 
 def _job_movers() -> None:
     """Market-wide top-gainers + most-active scanner — catches the micro-cap bangs
@@ -142,12 +157,12 @@ def _job_movers() -> None:
     if not (CONFIG.alpaca_api_key and CONFIG.alpaca_api_secret):
         return
     from .ingestors.market_movers import MarketMoversIngestor
-    MarketMoversIngestor().poll()
+    _cached("movers", MarketMoversIngestor).poll()
 
 def _job_earnings_calendar() -> None:
     """Pull next 30 days of US earnings from Finnhub. Runs twice daily."""
     from .ingestors.earnings_calendar import EarningsCalendarIngestor
-    EarningsCalendarIngestor().poll()
+    _cached("earnings_calendar", EarningsCalendarIngestor).poll()
 
 def _job_t212_snap() -> None:
     if not CONFIG.has_t212:
@@ -238,6 +253,11 @@ def configure_logging() -> None:
     )
     # Quiet werkzeug's per-request access log to avoid log spam
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    # yfinance emits its own ERROR lines for crypto/index symbols it can't price
+    # ("$BTCUSD: possibly delisted", "$ES_F: no timezone found") — ~3,400/run of
+    # benign spam that buries real errors. Our price fetcher already catches those
+    # failures at debug level, so silence yfinance's logger.
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
     logging.basicConfig(
         level=logging.INFO,
         handlers=[file_handler, stream_handler],
@@ -277,13 +297,16 @@ def build_scheduler() -> BackgroundScheduler:
         ("llm_classify",   _job_llm_classify,   DEFAULTS["llm_classify_seconds"]),
         ("price_action",   _job_price_action,   DEFAULTS["price_action_seconds"]),
     ]
-    for name, fn, interval in jobs:
+    for i, (name, fn, interval) in enumerate(jobs):
         sched.add_job(
             _safe(name, fn),
             trigger=IntervalTrigger(seconds=interval),
             id=name,
             replace_existing=True,
-            next_run_time=datetime.utcnow(),  # run once immediately at startup
+            # Stagger startup ~3s/job so a restart doesn't fire all ~15 jobs
+            # (50 RSS feeds + SEC + movers + scoring + ML) at once — that thundering
+            # herd spiked connections/FDs. tz-aware (datetime.utcnow() is deprecated).
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=i * 3),
         )
         log.info("scheduled %-20s every %ds", name, interval)
 

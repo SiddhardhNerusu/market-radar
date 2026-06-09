@@ -45,6 +45,10 @@ FEED_URL = (
 # used downstream by the scorer.
 FORM_TYPES = {
     "8-K": "material_event",
+    "6-K": "material_event",   # foreign issuers' material-news filing (their 8-K equivalent).
+                                # Many micro-cap runners are foreign (Chinese/Israeli/etc.) and
+                                # file catalysts as 6-K — without this we're blind to all of them
+                                # (e.g. RGNT's European-launch 6-K that ran it +141% on 2026-06-09).
     "4": "insider_transaction",
     "SC 13D": "activist_position",
     "SC 13G": "passive_5pct_stake",

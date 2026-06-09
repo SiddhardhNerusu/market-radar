@@ -2730,7 +2730,14 @@ class LiveTrader:
             # server stops, so the poller keeps managing those itself (below).
             if not hasattr(self, "_stock_trailstops"):
                 self._stock_trailstops = {}
-            if market_open and sym not in self._stock_trailstops:
+            if not hasattr(self, "_stock_trailstop_fail_ts"):
+                self._stock_trailstop_fail_ts = {}
+            # After an arm failure (e.g. the name is HALTED -> 403 on POST /orders), back
+            # off instead of retrying every 30s loop; the poller manages it meanwhile and
+            # we re-attempt once the cooldown elapses (e.g. the halt clears).
+            _ARM_RETRY_COOLDOWN_S = 300
+            _arm_cooled = (now_ts - self._stock_trailstop_fail_ts.get(sym, 0.0)) < _ARM_RETRY_COOLDOWN_S
+            if market_open and sym not in self._stock_trailstops and not _arm_cooled:
                 existing_id = None
                 try:  # adopt an existing trailing_stop (e.g. after a bot restart) — no dupes
                     for o in self.alpaca.list_orders(status="open", limit=200):
@@ -2753,11 +2760,13 @@ class LiveTrader:
                             client_order_id=f"mr-ts-{tp_sl['score_id']}-{int(now_ts)}",
                         )
                         self._stock_trailstops[sym] = ts.id
+                        self._stock_trailstop_fail_ts.pop(sym, None)
                         log.info("[server-stop] %s armed trailing_stop %.1f%% broker-side — "
                                  "poller hands off RTH exit", sym, giveback * 100)
                     except AlpacaError as exc:
-                        log.warning("[server-stop] %s arm failed (poller still manages): %s",
-                                    sym, exc)
+                        self._stock_trailstop_fail_ts[sym] = now_ts
+                        log.warning("[server-stop] %s arm failed — poller manages, backing off %ds "
+                                    "(likely halted): %s", sym, _ARM_RETRY_COOLDOWN_S, exc)
             if market_open and sym in self._stock_trailstops:
                 continue  # broker-side trailing_stop owns this RTH exit
 

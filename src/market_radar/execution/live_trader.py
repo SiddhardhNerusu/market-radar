@@ -1922,7 +1922,16 @@ class LiveTrader:
                     earnings_reason = f"earnings_in_{dte_to_earnings}d"
             except Exception:  # noqa: BLE001
                 pass
-        total_mult = conf_mult * regime_mult * learn_mult * earnings_mult
+        # Bound the multiplier stack. Four weakly-independent multipliers (confluence,
+        # regime, learning, earnings) multiplied together can compound to ~4x — over-Kelly,
+        # which defeats the fractional-Kelly variance control — or shrink to ~0.13x. Clamp
+        # the product to a sane band so conviction scales size modestly without the stack
+        # ever blowing past a safe ceiling. The hard per-position cap (6%) remains the final
+        # ceiling; env-tunable bounds.
+        _raw_mult = conf_mult * regime_mult * learn_mult * earnings_mult
+        _MULT_FLOOR = float(os.getenv("LIVE_SIZE_MULT_FLOOR", "0.4"))
+        _MULT_CEIL = float(os.getenv("LIVE_SIZE_MULT_CEIL", "1.5"))
+        total_mult = max(_MULT_FLOOR, min(_MULT_CEIL, _raw_mult))
         eff_equity = self._effective_equity(account)
         adjusted_equity = eff_equity * total_mult
         # Crypto allows fractional qty, lower min_qty floor too

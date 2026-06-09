@@ -187,7 +187,10 @@ def train_and_save(
 
     rows.sort(key=lambda r: r.get("scored_at") or "")
     X_all = extract_features_df(rows)
-    y_all = np.array([1 if (r.get(_label_col) or 0) > 0 else 0 for r in rows])
+    # Dead-band: only a MEANINGFUL up-move is labelled 1, so the model isn't taught to
+    # treat noise around zero as signal (previously +0.05% and +20% were both class 1).
+    _deadband = float(os.getenv("ML_LABEL_DEADBAND_PCT", "0.2"))
+    y_all = np.array([1 if (r.get(_label_col) or 0) > _deadband else 0 for r in rows])
 
     # --- Walk-forward CV ---
     n_splits = min(n_splits, max(2, len(rows) // 500))
@@ -287,7 +290,14 @@ def train_and_save(
         log.info("  ✓ Last-fold train/val gap %.3f — model generalises reasonably", gap)
 
     deploy = True
-    if only_replace_if_better and CURRENT_POINTER.exists():
+    # Absolute floor: never deploy a model barely better than a coin flip, even if it
+    # beats the previous one — a < ~0.53 AUC model has no real edge to trade on.
+    _min_deploy_auc = float(os.getenv("ML_MIN_DEPLOY_AUC", "0.53"))
+    if median_val_auc < _min_deploy_auc:
+        deploy = False
+        log.warning("New median val_auc %.4f < absolute floor %.2f — not deploying",
+                    median_val_auc, _min_deploy_auc)
+    if deploy and only_replace_if_better and CURRENT_POINTER.exists():
         try:
             prev_meta = json.loads(CURRENT_POINTER.read_text())
             prev_auc = prev_meta.get("val_auc") or 0

@@ -2458,7 +2458,7 @@ class LiveTrader:
             rows = conn.execute(
                 """
                 SELECT id, score_id, ticker, direction, qty, composite_score,
-                       take_profit, decided_at, alpaca_order_id
+                       take_profit, decided_at, alpaca_order_id, outcome
                 FROM bot_decisions
                 WHERE outcome IN ('pending_fill','placed')
                   AND outcome_detail='stock_polled' AND alpaca_order_id IS NOT NULL

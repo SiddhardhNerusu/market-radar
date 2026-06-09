@@ -2685,6 +2685,18 @@ class LiveTrader:
                         self.alpaca.cancel_order(self._stock_trailstops[s])
                     except AlpacaError:
                         pass
+                    # A position exited by the server-side trailing_stop is never in
+                    # _stock_exit_attempts, so mark its decision closed here too —
+                    # otherwise the 'placed' row lingers as a phantom (the exact bug
+                    # the option-spread / fill reconcilers were built to prevent).
+                    td = sl_tp_by_sym.get(s)
+                    if td:
+                        with get_connection() as conn:
+                            conn.execute(
+                                "UPDATE bot_decisions SET outcome='closed', "
+                                "outcome_detail='stock_server_stop_exited' WHERE score_id=?",
+                                (td["score_id"],),
+                            )
                     self._stock_trailstops.pop(s, None)
 
         if not sl_tp_by_sym or not stock_positions:

@@ -321,10 +321,17 @@ class RiskManager:
 
         # Rule 8: concentration / pile-on cap — limit the number of distinct
         # open names so the book can't load up on many correlated bets at once
-        # (2026-06-05 lesson: ~10 simultaneous bullish positions all sank
-        # together). Applies only when the caller supplies the live count.
-        if (current_position_count is not None
-                and current_position_count >= CONFIG.risk_max_concurrent_positions):
+        # (2026-06-05 lesson: ~10 simultaneous bullish positions all sank together).
+        # FAIL CLOSED: if the live count is unavailable, block — do not add risk.
+        # (Previously this returned True when count was None, silently bypassing the
+        # cap exactly when a positions-snapshot hiccup nulled the count.)
+        if current_position_count is None:
+            return RiskDecision(
+                False,
+                "Concentration cap: open-position count unavailable — blocking (fail-closed)",
+                "max_concurrent_positions",
+            )
+        if current_position_count >= CONFIG.risk_max_concurrent_positions:
             return RiskDecision(
                 False,
                 f"Concentration cap: {current_position_count} open names "

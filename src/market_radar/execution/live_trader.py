@@ -2277,8 +2277,13 @@ class LiveTrader:
         # this loop (the positions snapshot won't reflect it yet).
         self._add_pending_exposure(symbol, sized.notional_usd, is_crypto_order)
         if decision_id is not None and not is_crypto_order:
-            self._persist_order(bracket, sized=sized, direction=direction,
-                                symbol=symbol, decision_id=decision_id)
+            # Poll-managed stock entries are plain orders (no server-side bracket),
+            # so persist the bot_orders row from the simple order — not a 'bracket'
+            # (which no longer exists here; referencing it raised NameError on every
+            # stock entry and silently skipped bot_orders persistence).
+            self._persist_stock_order(simple, sized=sized, direction=direction,
+                                      symbol=symbol, decision_id=decision_id,
+                                      order_class=placed_kind)
         log.info(
             "PLACED %s %s %s qty=%g @~%.2f  SL=%.2f TP=%.2f  "
             "size=%.2f%% notional=$%.0f  order_id=%s",
@@ -2388,6 +2393,32 @@ class LiveTrader:
                  "bracket", sized.qty, p.limit_price or sized.entry_estimate,
                  sized.stop_loss, sized.take_profit,
                  p.status, p.filled_qty, p.filled_avg_price, p.submitted_at or utc_now()),
+            )
+
+    def _persist_stock_order(self, order, *, sized: SizingResult, direction: str,
+                             symbol: str, decision_id: int,
+                             order_class: str = "stock_polled") -> None:
+        """Persist a bot_orders row for a poll-managed stock entry — a plain order
+        with no server-side bracket. Mirrors _persist_order but reads the simple
+        Order directly (it has no .parent). Keeps the audit trail / reconciliation /
+        exposure math (which read bot_orders) intact for stock trades."""
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO bot_orders
+                    (decision_id, alpaca_order_id, client_order_id, ticker,
+                     direction, order_class, qty, submitted_price,
+                     stop_loss, take_profit,
+                     status, filled_qty, filled_avg_price, submitted_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (decision_id, getattr(order, "id", None),
+                 getattr(order, "client_order_id", None), symbol, direction,
+                 order_class, sized.qty, sized.entry_estimate,
+                 sized.stop_loss, sized.take_profit,
+                 getattr(order, "status", None), getattr(order, "filled_qty", 0),
+                 getattr(order, "filled_avg_price", None),
+                 getattr(order, "submitted_at", None) or utc_now()),
             )
 
     # ------------------------------------------------------------------
@@ -2547,6 +2578,13 @@ class LiveTrader:
             # (avoid cancel-replace churn / hammering a halted name every loop).
             if now_ts - self._stock_fill_retry_ts.get(score_id, 0.0) < RETRY_COOLDOWN_S:
                 continue
+            # Re-submit only the UNFILLED REMAINDER. A partially-filled order already
+            # has live shares; re-submitting the full qty would double-buy (over-fill
+            # and possibly breach the position cap).
+            filled = float(getattr(o, "filled_qty", 0) or 0)
+            remainder = qty - filled
+            if remainder < 1:
+                continue  # effectively filled — let it promote on the next snapshot
             try:
                 self.alpaca.cancel_order(r["alpaca_order_id"])
             except AlpacaError:
@@ -2555,12 +2593,12 @@ class LiveTrader:
             try:
                 if market_open:
                     new = self.alpaca.submit_simple_order(
-                        symbol=sym, side=direction, qty=qty,
+                        symbol=sym, side=direction, qty=remainder,
                         order_type="market", time_in_force="day", client_order_id=coid)
                 else:
                     buf = 1.005 if direction == "buy" else 0.995
                     new = self.alpaca.submit_simple_order(
-                        symbol=sym, side=direction, qty=qty,
+                        symbol=sym, side=direction, qty=remainder,
                         order_type="limit", limit_price=round(cur * buf, 2),
                         time_in_force="day", extended_hours=True, client_order_id=coid)
                 self._stock_fill_retry_ts[score_id] = now_ts

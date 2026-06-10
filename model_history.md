@@ -161,3 +161,15 @@ Auto-appended by `scripts/scheduled_retrain.py`. Each entry records what changed
 
 ---
 
+## 2026-06-10 03:00 UTC
+
+- **Exit code**: 0 (success)
+- **Old model**: `20260604T030102Z` (val_auc=0.7214)
+- **New model**: `20260604T030102Z` (val_auc=0.7214)
+- **Deployed**: no — AUC gate rejected new model
+- **Horizon**: 5 day
+- **Train rows**: 3730 / **Val rows**: 745
+- **Log file**: `retrain-20260610-0300.log`
+
+---
+

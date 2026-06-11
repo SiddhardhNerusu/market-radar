@@ -3036,6 +3036,15 @@ class LiveTrader:
                     log.debug("  trail tracking %s: peak=$%.4f effSL=$%.4f current=$%.4f",
                               pair, peak, effective_sl, current_price)
                 continue
+            # Cooldown: don't re-fire a close for the same pair while a prior
+            # market close is still settling. Without this, a slow/partial fill
+            # leaves the decision 'placed' and the position non-zero, so the next
+            # 30s loop fires ANOTHER full-qty close and double-books P&L.
+            import time as _t_cx_cd
+            if not hasattr(self, "_crypto_exit_attempts"):
+                self._crypto_exit_attempts = {}
+            if _t_cx_cd.time() - self._crypto_exit_attempts.get(key, 0.0) < 120.0:
+                continue
             # Close at market
             try:
                 close_side = "sell" if direction == "buy" else "buy"
@@ -3058,9 +3067,16 @@ class LiveTrader:
                     pnl = (current_price - entry) * qty
                 else:
                     pnl = (entry - current_price) * qty
+                self._crypto_exit_attempts[key] = _t_exit.time()  # arm cooldown
                 with get_connection() as conn:
                     self._update_daily_pnl(conn, pnl)
                     self._book_crypto_exit_pnl(conn, pair, qty, entry, pnl)
+                    # Mark the decision closed so the SL/TP query stops returning
+                    # it next loop (prevents duplicate closes / P&L re-booking).
+                    conn.execute(
+                        "UPDATE bot_decisions SET outcome='closed', "
+                        "outcome_detail=? WHERE score_id=? AND outcome='placed'",
+                        (f"crypto_{exit_reason}", tp_sl["score_id"]))
                 self._closed_this_loop.add(pair)  # guard the flip check from double-booking
                 try:
                     from ..notifications.realtime import TradeAlert, notify_trade

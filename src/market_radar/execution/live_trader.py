@@ -616,6 +616,30 @@ class LiveTrader:
             sl = next((float(o.stop_price) for o in children
                        if o.stop_price), None)
             direction = "buy" if p.qty >= 0 else "sell"
+
+            # ROGUE-ORPHAN GUARD: never adopt/manage a position larger than the entire
+            # intended account — the bot's own sizing is hard-capped, so it cannot have
+            # created one this big (it's a manual/stale/glitch position, e.g. the 16,128-
+            # share TRDA short that blew gross to $94k and silently blocked all trading).
+            # Flatten it instead (best-effort; the cover loop retries if it's halted).
+            _notional = abs(float(p.market_value or 0)) or abs(float(p.qty) * float(p.avg_entry_price))
+            _cap = float(self.cfg.override_equity_usd or 0)
+            if _cap > 0 and _notional > _cap:
+                log.error("[orphan-adopt] ROGUE position %s notional $%.0f > account $%.0f — "
+                          "FLATTENING, not adopting", sym, _notional, _cap)
+                try:
+                    self.alpaca.close_position(p.symbol)
+                except AlpacaError as exc:
+                    log.error("[orphan-adopt] rogue flatten %s failed (needs retry/manual): %s",
+                              sym, exc)
+                try:
+                    from ..notifications.realtime import TradeAlert, notify_trade
+                    notify_trade(TradeAlert(kind="ALERT", symbol=sym,
+                                            extra=f"ROGUE orphan ${_notional:.0f} — flattening, not adopting"))
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+
             with get_connection() as conn:
                 try:
                     conn.execute(

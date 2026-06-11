@@ -2824,6 +2824,14 @@ class LiveTrader:
                     exit_reason = "trail_take_profit" if effective_sl < entry else "stop_loss"
             self._stock_peaks[peak_key] = peak
 
+            # SAFETY: if the ACTUAL position sign disagrees with the decision direction
+            # (e.g. an exit overshot the position into a short), the position is wrong —
+            # force a flatten. This + closing by actual sign (below) prevents the
+            # 2026-06-10 death spiral where a 'buy' decision kept SELLING a flipped-short
+            # position, doubling the short every loop (63 -> ... -> 16,128 shares).
+            if (direction == "buy") != (float(p.qty) > 0):
+                exit_reason = exit_reason or "sign_mismatch_flatten"
+
             if not exit_reason:
                 continue
 
@@ -2834,8 +2842,15 @@ class LiveTrader:
                 continue
 
             try:
-                close_side = "sell" if direction == "buy" else "buy"
-                qty = abs(float(p.qty))
+                # Close side + qty from the ACTUAL position sign — NOT the decision
+                # direction. Selling to "close" a position that has flipped short GROWS
+                # the short (the 2026-06-10 TRDA death spiral). Keying on the live sign
+                # guarantees the order always REDUCES the position toward flat.
+                pos_qty = float(p.qty)
+                if pos_qty == 0:
+                    continue
+                close_side = "sell" if pos_qty > 0 else "buy"
+                qty = abs(pos_qty)
                 coid = f"mr-sx-{tp_sl['score_id']}-{int(now_ts * 1000)}"
                 if market_open:
                     self.alpaca.submit_simple_order(

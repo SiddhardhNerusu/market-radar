@@ -1009,6 +1009,15 @@ class LiveTrader:
         # submit adds to this; later candidates' risk checks include it.
         self._loop_pending = {"gross": 0.0, "crypto": 0.0, "ticker": {}}
 
+        # Fail-closed: never open new positions without a live positions snapshot.
+        # When `positions` is None the risk gate would fall back to the bot_orders
+        # DB mirror for gross/per-ticker exposure — exactly the stale path that let
+        # gross balloon to $94k against the $6k cap. No snapshot => no new opens.
+        if positions is None:
+            log.warning("No positions snapshot this loop — skipping new opens "
+                        "(fail-closed; exits/reconcile already ran on live state).")
+            return
+
         for cand in candidates[: self.cfg.max_candidates_per_loop]:
             try:
                 self._process_candidate(cand, account=account,
@@ -2552,6 +2561,7 @@ class LiveTrader:
                 if r["outcome"] == "pending_fill":
                     _mark(r["id"], "placed", "stock_polled")  # it filled — now a real position
                     self._stock_fill_retry_ts.pop(score_id, None)
+                    getattr(self, "_stock_fill_retry_count", {}).pop(score_id, None)
                     log.info("[fill] %s filled — promoted to placed (now exit-managed)", sym)
                 continue  # placed + open position = normal
             if sym in getattr(self, "_stock_exit_attempts", {}):
@@ -2567,6 +2577,7 @@ class LiveTrader:
                       "done_for_day", "suspended", "stopped"):
                 _mark(r["id"], "unfilled", "ext_no_fill")
                 self._stock_fill_retry_ts.pop(score_id, None)
+                getattr(self, "_stock_fill_retry_count", {}).pop(score_id, None)
                 log.info("[fill-reconcile] %s order %s — marked unfilled", sym, st)
                 continue
             if st not in ("new", "accepted", "partially_filled", "pending_new",
@@ -2603,6 +2614,7 @@ class LiveTrader:
                     pass
                 _mark(r["id"], "unfilled", "ext_no_fill")
                 self._stock_fill_retry_ts.pop(score_id, None)
+                getattr(self, "_stock_fill_retry_count", {}).pop(score_id, None)
                 log.info("[fill-reconcile] %s stop chasing (comp=%.1f relevant=%s profitable=%s) — unfilled",
                          sym, comp, relevant, profitable)
                 continue
@@ -2611,6 +2623,23 @@ class LiveTrader:
             # (avoid cancel-replace churn / hammering a halted name every loop).
             if now_ts - self._stock_fill_retry_ts.get(score_id, 0.0) < RETRY_COOLDOWN_S:
                 continue
+            # Hard attempt cap — runaway backstop. The relevance window alone would
+            # allow ~26 re-submits; cap total chases per order so a misbehaving
+            # cancel/fill cycle can never accumulate beyond a few attempts.
+            if not hasattr(self, "_stock_fill_retry_count"):
+                self._stock_fill_retry_count = {}
+            MAX_REFILLS = 3
+            if self._stock_fill_retry_count.get(score_id, 0) >= MAX_REFILLS:
+                try:
+                    self.alpaca.cancel_order(r["alpaca_order_id"])
+                except AlpacaError:
+                    pass
+                _mark(r["id"], "unfilled", "ext_refill_cap")
+                self._stock_fill_retry_ts.pop(score_id, None)
+                self._stock_fill_retry_count.pop(score_id, None)
+                log.info("[fill-retry] %s hit %d-attempt cap — giving up (unfilled)",
+                         sym, MAX_REFILLS)
+                continue
             # Re-submit only the UNFILLED REMAINDER. A partially-filled order already
             # has live shares; re-submitting the full qty would double-buy (over-fill
             # and possibly breach the position cap).
@@ -2618,10 +2647,28 @@ class LiveTrader:
             remainder = qty - filled
             if remainder < 1:
                 continue  # effectively filled — let it promote on the next snapshot
+            # Confirm the cancel actually landed before re-submitting. A swallowed
+            # cancel-failure (5xx, or the order filling in the race window) would
+            # otherwise leave the old order live AND add a fresh one => double-fill.
             try:
                 self.alpaca.cancel_order(r["alpaca_order_id"])
+            except AlpacaError as exc:
+                log.warning("[fill-retry] %s cancel failed (%s) — NOT re-submitting "
+                            "this loop (avoid double-fill)", sym, exc)
+                self._stock_fill_retry_ts[score_id] = now_ts  # respect cooldown, retry later
+                continue
+            try:
+                _chk = self.alpaca.get_order(r["alpaca_order_id"])
+                _chk_st = (_chk.status or "").lower()
             except AlpacaError:
-                pass
+                _chk_st = ""
+            if _chk_st not in ("canceled", "cancelled", "expired", "rejected",
+                               "done_for_day", "stopped"):
+                # Still live or already filled — do not stack a second order on top.
+                log.warning("[fill-retry] %s cancel not confirmed (status=%s) — "
+                            "skipping re-submit this loop", sym, _chk_st or "unknown")
+                self._stock_fill_retry_ts[score_id] = now_ts
+                continue
             coid = f"mr-refill-{score_id}-{int(now_ts * 1000)}"
             try:
                 if market_open:
@@ -2635,11 +2682,13 @@ class LiveTrader:
                         order_type="limit", limit_price=round(cur * buf, 2),
                         time_in_force="day", extended_hours=True, client_order_id=coid)
                 self._stock_fill_retry_ts[score_id] = now_ts
+                self._stock_fill_retry_count[score_id] = (
+                    self._stock_fill_retry_count.get(score_id, 0) + 1)
                 with get_connection() as conn:
                     conn.execute("UPDATE bot_decisions SET alpaca_order_id=? WHERE id=?",
                                  (new.id, r["id"]))
-                log.info("[fill-retry] %s comp=%.1f (relevant+profitable) — re-submitted to chase fill",
-                         sym, comp)
+                log.info("[fill-retry] %s comp=%.1f attempt %d/%d — re-submitted to chase fill",
+                         sym, comp, self._stock_fill_retry_count[score_id], MAX_REFILLS)
             except AlpacaError as exc:
                 log.warning("[fill-retry] %s re-submit failed: %s", sym, exc)
                 _mark(r["id"], "unfilled", "ext_no_fill")
@@ -3672,7 +3721,14 @@ class LiveTrader:
         so paper accounts (start $100k) size for the user's real capital."""
         if self.cfg.override_equity_usd > 0:
             return min(float(account.equity), self.cfg.override_equity_usd)
-        return float(account.equity)
+        # Fail-closed: the override is the ONLY thing capping sizing to the user's
+        # real ~£5k capital instead of the ~$93k paper balance. If it's ever unset
+        # or parses to <=0, do NOT silently size for the full paper equity — return
+        # 0 so the sizer produces qty 0 and nothing trades until it's fixed.
+        log.critical("LIVE_OVERRIDE_EQUITY_USD is <=0 (%s) — refusing to size for "
+                     "full paper equity. Set the override; no trades until then.",
+                     self.cfg.override_equity_usd)
+        return 0.0
 
     def _minutes_until_close(self) -> Optional[int]:
         """Minutes until next market close. None if clock fetch fails."""

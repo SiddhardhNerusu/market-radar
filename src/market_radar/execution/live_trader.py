@@ -363,15 +363,26 @@ class LiveTrader:
                     except Exception:  # noqa: BLE001
                         pass
                 row = conn.execute(
-                    "SELECT tp_fired, tp_peak_usd, loss_halt_fired FROM bot_daily_pnl WHERE trading_date=?",
+                    "SELECT tp_fired, tp_peak_usd, loss_halt_fired, realized_pnl_usd FROM bot_daily_pnl WHERE trading_date=?",
                     (_us_eastern_date().isoformat(),),
                 ).fetchone()
-            if row and row[0]:
+            # Only restore a 'fired' lock if the day actually banked profit. A fired
+            # flag with realized P&L <= 0 is corrupt: a genuine profit-take leaves
+            # realized strongly positive, whereas the TRDA incident armed the TP off
+            # a distorted (equity - last_equity) delta and persisted tp_fired=1 with
+            # $0 realized — restoring that froze the bot all day for no reason. Skip
+            # the lock in that case so the bot trades normally.
+            _row_realized = (row[3] if row and len(row) > 3 else None) or 0.0
+            if row and row[0] and _row_realized > 0:
                 self._daily_tp_fired_on = _date.today()
                 self._daily_tp_armed_on = _date.today()
                 self._daily_tp_peak = row[1] or 0.0
                 log.warning("🎯 Loaded TP state from DB: ALREADY FIRED today, peak was $%.2f",
                             self._daily_tp_peak or 0)
+            elif row and row[0]:
+                log.warning("🎯 DB row shows TP fired but realized=$%.2f (<=0) — treating "
+                            "as a corrupt/spurious lock; NOT restoring it (bot will trade).",
+                            _row_realized)
             # Restore the loss-halt flag too, so a restart during a halted day
             # keeps new entries blocked (don't re-expose the account).
             if row and len(row) > 2 and row[2]:
@@ -900,6 +911,14 @@ class LiveTrader:
         from datetime import date as _roll_date
         if getattr(self, "_daily_tp_fired_on", None) != _roll_date.today():
             self._daily_tp_notified = False
+            # Hard-reset the trailing-TP arm/peak on a new day. Previously only the
+            # notification flag reset here, so a prior day's peak persisted in memory
+            # and could keep the trail "armed" — after the TRDA incident distorted
+            # (equity - last_equity), a phantom $841 peak stranded the bot in
+            # "profit-take fired, skipping" for a full day. The fired flag itself
+            # goes stale via the date compare; clear the peak/armed state too.
+            self._daily_tp_peak = 0.0
+            self._daily_tp_armed_on = None
         # Reset the SELECTIVE loss-stop halt on day rollover too. It's a separate
         # flag (see _daily_loss_stop_if_due) and, like _daily_tp_fired_on, is set
         # on trigger and never otherwise cleared — without this, a loss-halt on

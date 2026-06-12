@@ -389,11 +389,23 @@ class RiskManager:
         per iteration with Alpaca's true equity.
         """
         try:
+            import os
+            # Optional drawdown baseline reset: measure the 30-day peak only from
+            # this ISO timestamp forward. Used to acknowledge a one-off, non-strategy
+            # equity hit (e.g. the TRDA bug's ~$8k paper loss) so the kill-switch
+            # doesn't halt the strategy forever on a fixed bug. Does NOT rewrite any
+            # equity history; the cap stays fully active from the new baseline.
+            _dd_baseline = os.getenv("RISK_DD_BASELINE_FROM", "").strip()
             with get_connection() as conn:
-                peak_row = conn.execute(
+                peak_sql = (
                     "SELECT MAX(equity_usd) AS peak FROM bot_account_snapshots "
                     "WHERE snapshot_at > strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now','-30 days'))"
-                ).fetchone()
+                )
+                peak_params: tuple = ()
+                if _dd_baseline:
+                    peak_sql += " AND snapshot_at >= ?"
+                    peak_params = (_dd_baseline,)
+                peak_row = conn.execute(peak_sql, peak_params).fetchone()
                 cur_row = conn.execute(
                     "SELECT equity_usd FROM bot_account_snapshots "
                     "ORDER BY snapshot_at DESC LIMIT 1"

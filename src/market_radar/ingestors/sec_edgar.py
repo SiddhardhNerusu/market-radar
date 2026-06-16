@@ -126,8 +126,13 @@ class SecEdgarIngestor(Ingestor):
     # ------------------------------------------------------------------
 
     def parse(self, raw_entry: dict[str, Any]) -> Optional[ParsedSignal]:
-        form = raw_entry.get("form", "")
         entry = raw_entry.get("entry") or {}
+        # EDGAR's &type= feed filter PREFIX-matches: type=4 also returns 424B2/
+        # 424B5 prospectuses, type=8-K returns 8-K/A, etc. So the QUERY form is
+        # NOT the entry's real form — trusting it mislabeled ~7,000 debt
+        # prospectuses as Form-4 (insider_transaction), poisoning classification,
+        # scoring and measurement. Derive the real form from the entry itself.
+        form = self._real_form(entry, raw_entry.get("form", ""))
 
         external_id = (
             getattr(entry, "id", None)
@@ -149,6 +154,11 @@ class SecEdgarIngestor(Ingestor):
         # text. Best-effort: a failed fetch leaves body=summary so the
         # row still records.
         body: Optional[str] = summary
+        # body_hydrated=False means body is still the RSS metadata STUB (useless to
+        # the classifier). Live ingestion runs fetch_bodies=False (fast, no HTTP in
+        # the poll loop) and the out-of-band sec_hydrate job fills the real body
+        # later, flipping this flag. Backfill paths fetch inline (hydrated=True).
+        body_hydrated = False
         if self.fetch_bodies and self._body_fetcher is not None and link:
             try:
                 fetched = self._body_fetcher.fetch_body(link, form_type=form)
@@ -158,6 +168,7 @@ class SecEdgarIngestor(Ingestor):
                 fetched = None
             if fetched:
                 body = fetched
+                body_hydrated = True
 
         cik = self._extract_cik(title or "")
         ticker = CIK_LOOKUP.get_ticker(cik) if cik else None
@@ -193,11 +204,33 @@ class SecEdgarIngestor(Ingestor):
                 "title": title,
                 "summary": summary,
                 "link": link,
+                "body_hydrated": body_hydrated,
             },
             tickers=tickers,
         )
 
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _real_form(entry: Any, fallback: str) -> str:
+        """The entry's ACTUAL form type — see parse(). EDGAR's &type= filter
+        prefix-matches, so the query form is unreliable. Prefer the Atom category
+        term, then the title's leading token ('424B2 - Co (CIK)' -> '424B2'),
+        then the feed-query fallback."""
+        try:
+            for t in (getattr(entry, "tags", None) or []):
+                term = (t.get("term") if isinstance(t, dict)
+                        else getattr(t, "term", None))
+                if term and str(term).strip():
+                    return str(term).strip()
+        except Exception:  # noqa: BLE001
+            pass
+        title = getattr(entry, "title", "") or ""
+        if " - " in title:
+            head = title.split(" - ", 1)[0].strip()
+            if head:
+                return head
+        return fallback
 
     @staticmethod
     def _extract_cik(title: str) -> Optional[int]:

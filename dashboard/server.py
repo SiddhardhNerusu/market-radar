@@ -309,10 +309,23 @@ def create_app() -> Flask:
         try:
             from market_radar.storage import get_connection
             with get_connection() as conn:
+                # P1 fix: bot_daily_pnl.trading_date is keyed on US/Eastern (the
+                # writers use _us_eastern_date), but date('now') is UTC — so
+                # 00:00-04:00 UTC read the WRONG day's row. Compute the Eastern
+                # date here (DST-aware) and pass it as a parameter.
+                from datetime import datetime as _dt, timedelta as _td
+                try:
+                    from zoneinfo import ZoneInfo as _ZI
+                    _now_et = _dt.now(_ZI("America/New_York"))
+                except Exception:  # noqa: BLE001 — zoneinfo/tzdata unavailable
+                    _now_et = _dt.utcnow()
+                _today_et = _now_et.strftime("%Y-%m-%d")
+                _week_ago_et = (_now_et - _td(days=7)).strftime("%Y-%m-%d")
                 today_pnl = conn.execute(
                     "SELECT COALESCE(realized_pnl_usd,0), COALESCE(trades_count,0), "
                     "       COALESCE(wins,0), COALESCE(losses,0) "
-                    "FROM bot_daily_pnl WHERE trading_date = date('now')"
+                    "FROM bot_daily_pnl WHERE trading_date = ?",
+                    (_today_et,),
                 ).fetchone() or (0.0, 0, 0, 0)
 
                 open_orders = conn.execute(
@@ -343,7 +356,8 @@ def create_app() -> Flask:
                 week = conn.execute(
                     "SELECT SUM(realized_pnl_usd), SUM(trades_count), "
                     "       SUM(wins), SUM(losses) FROM bot_daily_pnl "
-                    "WHERE trading_date >= date('now','-7 days')"
+                    "WHERE trading_date >= ?",
+                    (_week_ago_et,),
                 ).fetchone() or (0.0, 0, 0, 0)
 
                 latest_eq = conn.execute(

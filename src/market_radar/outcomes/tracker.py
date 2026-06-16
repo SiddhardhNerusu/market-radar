@@ -26,6 +26,41 @@ from .price_fetcher import PriceFetcher, PriceSnapshot
 
 log = logging.getLogger(__name__)
 
+# Label hygiene thresholds (P1 rebuild 2026-06-15). A sub-$1 anchor makes the
+# return division unreliable (a $0.0001 anchor produced +3,002,400%); a return
+# beyond _MAX_ABS_RETURN_PCT on a >=$1 name over 1-20 trading days is almost
+# always a split / ticker-reuse artifact, not a real move. Such rows are flagged
+# data_corrupt and excluded from training + edge measurement.
+_MIN_ANCHOR_USD = 1.0
+_MAX_ABS_RETURN_PCT = 600.0
+
+
+def classify_return(
+    anchor_px, close, *, min_anchor: float = _MIN_ANCHOR_USD,
+    max_abs: float = _MAX_ABS_RETURN_PCT,
+):
+    """Compute a post-flag return % and a data-corruption flag.
+
+    Returns ``(ret_pct, data_corrupt)``:
+      - sub-``min_anchor`` or missing anchor -> (None, 1)  [the $0.0001 -> +3,002,400% bug]
+      - missing / zero close -> (None, 0)  [simply not resolved yet; not corrupt]
+      - |return| > ``max_abs`` -> (None, 1)  [split / ticker-reuse artifact]
+      - otherwise -> (ret_pct, 0)
+    """
+    try:
+        anchor = float(anchor_px) if anchor_px is not None else None
+    except (TypeError, ValueError):
+        anchor = None
+    # ``anchor != anchor`` catches NaN (float("nan") does not raise).
+    if anchor is None or anchor != anchor or anchor < min_anchor:
+        return None, 1
+    if not close:
+        return None, 0
+    ret = (close - anchor) / anchor * 100.0
+    if ret != ret or abs(ret) > max_abs:  # NaN or implausible -> corrupt
+        return None, 1
+    return ret, 0
+
 
 @dataclass
 class SnapshotStats:
@@ -216,12 +251,11 @@ def update_due_outcomes(
                     continue
                 close, close_ts = lookup
 
-                ret_pct: Optional[float] = None
-                if row["price_at_flag"] is not None and close:
-                    try:
-                        ret_pct = (close - float(row["price_at_flag"])) / float(row["price_at_flag"]) * 100.0
-                    except (TypeError, ValueError, ZeroDivisionError):
-                        ret_pct = None
+                # Label hygiene (P1 rebuild): a sub-$1/missing anchor or an
+                # implausible (split/ticker-reuse) move is flagged data_corrupt
+                # with a NULL return, so training + edge stats exclude it rather
+                # than learn the artifact. See classify_return + tests.
+                ret_pct, data_corrupt = classify_return(row["price_at_flag"], close)
 
                 try:
                     conn.execute(
@@ -230,6 +264,8 @@ def update_due_outcomes(
                            SET {price_col} = ?,
                                {ts_col}    = ?,
                                return_{window_days}d_pct = ?,
+                               data_corrupt = CASE WHEN ? = 1 THEN 1
+                                                   ELSE COALESCE(data_corrupt, 0) END,
                                resolve_attempts = 0,
                                fully_resolved = CASE
                                    WHEN ? = 'price_20d' THEN 1
@@ -237,7 +273,8 @@ def update_due_outcomes(
                                END
                          WHERE id = ?
                         """,
-                        (close, close_ts, ret_pct, price_col, row["outcome_id"]),
+                        (close, close_ts, ret_pct, data_corrupt, price_col,
+                         row["outcome_id"]),
                     )
                     stats.updated += 1
                     if price_col == "price_20d":
@@ -284,6 +321,7 @@ def hit_rates_by_signal_class(
             FROM signal_scores ss
             JOIN signal_outcomes so ON so.score_id = ss.id
             WHERE ss.signal_class IS NOT NULL
+              AND COALESCE(so.data_corrupt, 0) = 0   -- P1: exclude corrupt-label rows
             GROUP BY ss.signal_class
             HAVING COUNT(*) >= ?
             ORDER BY samples DESC

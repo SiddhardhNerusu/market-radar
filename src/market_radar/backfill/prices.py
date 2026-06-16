@@ -89,7 +89,7 @@ class HistoricalPriceCache:
                 end=(end + timedelta(days=1)).isoformat(),
                 interval="1d",
                 group_by="ticker",
-                auto_adjust=False,
+                auto_adjust=True,  # split/div-adjusted: anchor + offset on one basis (P1)
                 progress=False,
                 threads=True,
             )

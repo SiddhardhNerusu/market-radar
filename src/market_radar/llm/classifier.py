@@ -24,6 +24,9 @@ from ..config import CONFIG
 from ..storage import get_connection
 from .filter import should_classify
 from .prompt import (
+    CLASSIFY_TOOL,
+    LOW_CONFIDENCE_EVENT,
+    LOW_CONFIDENCE_THRESHOLD,
     SYSTEM_PROMPT,
     approx_input_tokens,
     approx_output_tokens,
@@ -98,6 +101,8 @@ class LLMClassifier:
                     max_tokens=500,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": user_msg}],
+                    tools=[CLASSIFY_TOOL],
+                    tool_choice={"type": "tool", "name": "classify_signal"},
                 )
                 break
             except Exception as exc:  # noqa: BLE001
@@ -121,32 +126,29 @@ class LLMClassifier:
         if msg is None:
             return None
 
-        # Parse response
-        try:
-            raw_text = "".join(
-                block.text for block in msg.content if hasattr(block, "text")
-            ).strip()
-            # Trim accidental code-fence wrapping
-            if raw_text.startswith("```"):
-                raw_text = raw_text.split("\n", 1)[1] if "\n" in raw_text else raw_text
-                if raw_text.endswith("```"):
-                    raw_text = raw_text[:-3]
-                raw_text = raw_text.strip()
-                if raw_text.startswith("json"):
-                    raw_text = raw_text[4:].strip()
-            parsed = json.loads(raw_text)
-        except (json.JSONDecodeError, AttributeError, IndexError) as exc:
-            log.warning("LLM returned non-JSON for signal_id=%s: %s",
-                        row.get("signal_id"), exc)
+        # Parse the FORCED tool call — guaranteed schema-valid input, so there is
+        # NO free-text json.loads / code-fence path that can fail (blueprint #3
+        # L137: zero parse-failure log lines over a full run).
+        parsed: Optional[dict] = None
+        for block in msg.content:
+            if (getattr(block, "type", None) == "tool_use"
+                    and getattr(block, "name", None) == "classify_signal"):
+                parsed = dict(block.input or {})
+                break
+        if parsed is None:
+            # No tool call (e.g. stop_reason='refusal') — skip, re-queue later.
+            log.warning("LLM returned no classify_signal tool call for signal_id=%s",
+                        row.get("signal_id"))
             return None
 
-        # Validate required fields exist (even if null)
-        for k in ("event_type", "sentiment", "sentiment_magnitude", "factual",
-                  "tickers_mentioned", "extracted_fields", "confidence"):
-            if k not in parsed:
-                log.warning("LLM response missing key %s for signal_id=%s",
-                            k, row.get("signal_id"))
-                return None
+        # Low-confidence gate: bucket untrusted labels so they don't reach the
+        # trade gate, but remain re-queueable.
+        try:
+            if float(parsed.get("confidence") or 0.0) < LOW_CONFIDENCE_THRESHOLD:
+                parsed["event_type"] = LOW_CONFIDENCE_EVENT
+        except (TypeError, ValueError):
+            parsed["event_type"] = LOW_CONFIDENCE_EVENT
+        parsed.setdefault("extracted_fields", {})
 
         # Compute actual cost from response usage
         actual_in = getattr(msg.usage, "input_tokens", in_toks)
@@ -244,6 +246,14 @@ def classify_pending(*, batch_size: int = 50,
             WHERE lc.id IS NULL
               AND rs.source NOT LIKE 'sec_edgar_backfill_%'
               AND rs.ingested_at >= strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', '-2 days'))
+              -- Don't classify an un-hydrated SEC stub (RSS metadata only) while
+              -- it's young — give the out-of-band hydrate job time to fill the
+              -- real body. After a 15-min grace, classify anyway so a stub whose
+              -- body never resolves is never permanently lost.
+              AND NOT (rs.source = 'sec_edgar'
+                       AND COALESCE(json_extract(rs.raw_payload, '$.body_hydrated'), 1) = 0
+                       AND rs.ingested_at >= strftime('%Y-%m-%dT%H:%M:%SZ',
+                                                      datetime('now', '-15 minutes')))
             ORDER BY ss.composite_score DESC, ss.id DESC
             LIMIT ?
             """,
@@ -310,6 +320,43 @@ def classify_pending(*, batch_size: int = 50,
                     seen_hashes.add(chash)
                     continue
                 seen_hashes.add(chash)
+
+            # Deterministic SEC routing (blueprint #3): an 8-K's Item codes / a
+            # form type ARE its event taxonomy — classify without the LLM (and
+            # skip the API cost) for sec_edgar rows with a real (hydrated) body.
+            if r.get("source") == "sec_edgar":
+                from ..ingestors.sec_item_codes import (
+                    BEARISH_8K_EVENTS, sec_event_type, subtype_for_text,
+                )
+                try:
+                    _form = json.loads(r.get("raw_payload") or "{}").get("form")
+                except (TypeError, ValueError):
+                    _form = None
+                det_event = sec_event_type(_form, r.get("body"))
+                if det_event:
+                    _bearish = det_event in BEARISH_8K_EVENTS
+                    det = {
+                        "event_type": det_event,
+                        "event_subtype": subtype_for_text(r.get("body")),
+                        "sentiment": -0.6 if _bearish else 0.0,
+                        "sentiment_magnitude": 0.6 if _bearish else 0.0,
+                        "factual": 1, "extracted_fields": {}, "confidence": 0.9,
+                        "model": "deterministic_sec",
+                        "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+                    }
+                    classifier.store(conn, signal_id=r["signal_id"],
+                                     ticker=r["ticker"], result=det)
+                    try:
+                        from ..scoring.composite import rescore_with_classification
+                        rescore_with_classification(
+                            conn, signal_id=r["signal_id"], ticker=r["ticker"],
+                            event_type=det_event, sentiment=det["sentiment"],
+                            sentiment_magnitude=det["sentiment_magnitude"], factual=1)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("rescore after deterministic SEC classify failed "
+                                    "(%s/%s): %s", r["signal_id"], r["ticker"], exc)
+                    stats.classified += 1
+                    continue
 
             # Actual LLM call
             try:

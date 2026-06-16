@@ -246,7 +246,7 @@ class PriceFetcher:
                 start=start.strftime("%Y-%m-%d"),
                 end=end.strftime("%Y-%m-%d"),
                 interval="1d",
-                auto_adjust=False,
+                auto_adjust=True,  # split/div-adjusted close for outcome returns (P1)
             )
         except Exception as exc:  # noqa: BLE001
             log.debug("history fetch failed for %s: %s", yf_sym, exc)

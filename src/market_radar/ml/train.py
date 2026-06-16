@@ -125,6 +125,32 @@ def _print_calibration_table(val_pred, y_val) -> None:
         )
 
 
+def _cap_rows_per_day(rows: list[dict], max_per_day: int) -> list[dict]:
+    """Leakage control (P1 rebuild): cap rows sharing a scored_at calendar day.
+
+    A handful of days dominate the labelled set (2026-05-27/05-28 were ~63% of
+    rows), and same-day rows share news events with correlated forward returns —
+    so an uncapped day lands in BOTH the train and val side of a walk-forward
+    fold and leaks. We deterministically (evenly-spaced) subsample any
+    over-represented day to ``max_per_day`` and re-sort chronologically.
+    ``max_per_day <= 0`` disables the cap.
+    """
+    if max_per_day <= 0:
+        return rows
+    by_day: dict[str, list[dict]] = {}
+    for r in rows:
+        by_day.setdefault((r.get("scored_at") or "")[:10], []).append(r)
+    kept: list[dict] = []
+    for day_rows in by_day.values():
+        if len(day_rows) <= max_per_day:
+            kept.extend(day_rows)
+        else:
+            step = len(day_rows) / max_per_day
+            kept.extend(day_rows[int(i * step)] for i in range(max_per_day))
+    kept.sort(key=lambda r: r.get("scored_at") or "")
+    return kept
+
+
 def train_and_save(
     *,
     min_rows: int = MIN_TRAINING_ROWS,
@@ -187,6 +213,13 @@ def train_and_save(
         )
 
     rows.sort(key=lambda r: r.get("scored_at") or "")
+    # Leakage control: cap any single scored_at day so its correlated event
+    # cluster can't dominate (and straddle) the walk-forward folds.
+    _max_per_day = int(os.getenv("ML_MAX_ROWS_PER_DAY", "1200"))
+    _n_before = len(rows)
+    rows = _cap_rows_per_day(rows, _max_per_day)
+    if len(rows) != _n_before:
+        log.info("Per-day cap (max %d/day): %d -> %d rows", _max_per_day, _n_before, len(rows))
     X_all = extract_features_df(rows)
     # Dead-band: only a MEANINGFUL up-move is labelled 1, so the model isn't taught to
     # treat noise around zero as signal (previously +0.05% and +20% were both class 1).
@@ -195,7 +228,18 @@ def train_and_save(
 
     # --- Walk-forward CV ---
     n_splits = min(n_splits, max(2, len(rows) // 500))
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    # Embargo (P1 rebuild): separate train from val by ~the label horizon so a
+    # row's forward-return window can't overlap the validation period — the
+    # purge/embargo the old bare TimeSeriesSplit only *claimed* in its docstring.
+    _embargo = int(os.getenv("ML_EMBARGO_ROWS", "200"))
+    # Cap the embargo so it can never exceed a fold's test size — otherwise
+    # TimeSeriesSplit raises ValueError on small per-event buckets (the
+    # multi-horizon/per-bucket trainers call this with few hundred rows).
+    _safe_gap = max(0, min(_embargo, len(rows) // (n_splits + 1) - 1))
+    if _safe_gap < _embargo:
+        log.info("Embargo gap reduced %d -> %d for n=%d, %d folds (small bucket)",
+                 _embargo, _safe_gap, len(rows), n_splits)
+    tscv = TimeSeriesSplit(n_splits=n_splits, gap=_safe_gap)
     fold_train_aucs: list[float] = []
     fold_val_aucs: list[float] = []
     last_train_idx = None
@@ -298,6 +342,13 @@ def train_and_save(
         deploy = False
         log.warning("New median val_auc %.4f < absolute floor %.2f — not deploying",
                     median_val_auc, _min_deploy_auc)
+    # Stability gate (P1 rebuild): a model whose val AUC swings wildly fold-to-fold
+    # has no reproducible edge — refuse to deploy it (the old code only warned).
+    _max_fold_std = float(os.getenv("ML_MAX_FOLD_STD", "0.05"))
+    if deploy and val_auc_std > _max_fold_std:
+        deploy = False
+        log.warning("Fold-to-fold val AUC std %.3f > %.2f — too regime-unstable "
+                    "to deploy (P1 stability gate)", val_auc_std, _max_fold_std)
     if deploy and only_replace_if_better and CURRENT_POINTER.exists():
         try:
             prev_meta = json.loads(CURRENT_POINTER.read_text())
@@ -479,12 +530,13 @@ def _load_training_rows(*, require_horizon: str = "return_5d_pct") -> list[dict]
               -- the same COALESCE expression used for the event_type column.
               AND COALESCE(lc.event_type, ss.event_type) != 'other'
               AND rs.source NOT LIKE 'sec_edgar_backfill_%'
-              -- Outlier filter: stock splits / reverse splits / ticker
-              -- reuse can show 1,000%+ returns (e.g., INRE 3,002,400%).
-              -- These poison the model's notion of "winners." Loosened from
-              -- 50 → 200 so genuine +50-100% catalyst winners (the strategy's
-              -- target trades) survive while split/data artifacts (>200%) drop.
-              AND ABS(so.{require_horizon}) < 200.0
+              -- Label hygiene (P1 rebuild 2026-06-15): exclude rows the outcome
+              -- tracker flagged data_corrupt (sub-$1 anchor division blowups +
+              -- split/ticker-reuse artifacts). Replaces the old magic
+              -- ABS(return)<200 band-aid: with floored anchors + split-adjusted
+              -- closes, genuine +50-200% catalyst winners now survive while the
+              -- artifacts (e.g. INRE +3,002,400%) are flagged and dropped here.
+              AND COALESCE(so.data_corrupt, 0) = 0
             """
         ).fetchall()
     return [dict(r) for r in rows]

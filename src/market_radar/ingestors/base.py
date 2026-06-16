@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
 from ..storage import get_connection, insert_raw_signal
-from ..storage.db import record_daemon_health
+from ..storage.db import record_daemon_health, record_daemon_health_history
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +95,7 @@ class Ingestor(abc.ABC):
             log.exception("[%s] fetch failed", self.source)
             with get_connection() as conn:
                 record_daemon_health(conn, source=self.source, success=False, error=str(exc))
+                record_daemon_health_history(conn, source=self.source, success=False, errors=1)
             result.errors += 1
             return result
 
@@ -102,20 +103,27 @@ class Ingestor(abc.ABC):
         if not raw_entries:
             with get_connection() as conn:
                 record_daemon_health(conn, source=self.source, success=True)
+                record_daemon_health_history(conn, source=self.source, success=True, inserted=0)
             return result
 
+        # Parse OUTSIDE any write connection. parse() may do network I/O (the SEC
+        # body fetcher historically did), and holding the single SQLite writer
+        # across HTTP back-pressures every other writer and starves WAL
+        # checkpoints — a root cause of the 79.5-min publish->score latency.
+        # Parse to memory first, then open the writer only for the fast insert.
+        parsed: list[ParsedSignal] = []
+        for entry in raw_entries:
+            try:
+                signal = self.parse(entry)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[%s] parse failed: %s", self.source, exc, exc_info=True)
+                result.errors += 1
+                continue
+            if signal is not None:
+                parsed.append(signal)
+
         with get_connection() as conn:
-            for entry in raw_entries:
-                try:
-                    signal = self.parse(entry)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("[%s] parse failed: %s", self.source, exc, exc_info=True)
-                    result.errors += 1
-                    continue
-
-                if signal is None:
-                    continue
-
+            for signal in parsed:
                 try:
                     inserted_id = insert_raw_signal(
                         conn,
@@ -145,6 +153,9 @@ class Ingestor(abc.ABC):
                     result.inserted += 1
 
             record_daemon_health(conn, source=self.source, success=result.errors == 0)
+            record_daemon_health_history(
+                conn, source=self.source, success=result.errors == 0,
+                inserted=result.inserted, errors=result.errors)
 
         log.info(
             "[%s] poll done: fetched=%d inserted=%d dup=%d err=%d",

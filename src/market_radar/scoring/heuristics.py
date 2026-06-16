@@ -218,7 +218,7 @@ def classify_heuristic(
         backfill_map = {
             "m_a_communication": "m_a_announcement",
             "material_event_amend": "material_event_amend",
-            "activist_position_amend": "activist_position",
+            "activist_position_amend": "activist_position_amend",
             "passive_5pct_stake_amend": "passive_5pct_stake",
             "ipo_registration_amend": "ipo_registration",
         }
@@ -303,6 +303,9 @@ def classify_heuristic(
         bullish_events = {
             "earnings_beat", "guidance_raise", "fda_approval", "analyst_upgrade",
             "insider_buy", "buyback", "dividend",
+            # 13D INITIATION is bullish per 15y of event studies (Brav/Jiang).
+            # Amends (13D/A, 13G) are now a SEPARATE event_type and stay neutral.
+            "activist_position",
         }
         bearish_events = {
             "earnings_miss", "guidance_cut", "fda_rejection", "analyst_downgrade",

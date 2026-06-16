@@ -23,13 +23,23 @@ Approximations (be honest about them):
       This is theoretical max-on-expiry; in reality you'd take profits earlier
       via the 50%-of-max rule, but for backtest we use a simple proxy.
 
-  - 5 bps round-trip slippage applied per trade.
+  - Round-trip cost is PRICE-BUCKETED (100-400 bps for sub-$5 names; see
+    _round_trip_cost_frac), NOT a flat 5 bps — the old 5 bps flattered every
+    small-cap result by 1-2 orders of magnitude.
   - Daily P&L aggregated by the day the signal was scored.
+
+UPPER-BOUND WARNING: without intraday bars we can't simulate the true price
+PATH, so TP/SL logic uses the final 5-day return as a proxy. That is OPTIMISTIC
+(it assumes a winner that ended above TP was never stopped out first). Treat any
+positive result here as an UPPER BOUND: a strategy that fails this backtest will
+certainly fail live; one that passes still needs a live pilot before scaling.
+Corrupt-flagged outcomes (data_corrupt) are excluded.
 """
 from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -41,9 +51,41 @@ log = logging.getLogger("marketradar.backtest")
 
 Mode = Literal["stock", "options"]
 
-# Slippage round-trip in basis points (entry + exit combined)
-SLIPPAGE_BPS = 5
 ATR_PCT_ASSUMPTION = 0.02  # 2% of price as ATR proxy if we don't have it
+
+# Option spreads bleed the bid/ask of BOTH legs — model a heavy round-trip on
+# the debit. Illiquid single-name verticals routinely give up 10%+ of the debit.
+_OPTION_RT_COST_FRAC = float(os.getenv("BACKTEST_OPTION_RT_COST", "0.10"))
+
+
+def _round_trip_cost_frac(price: float) -> float:
+    """Realistic round-trip (entry+exit) transaction cost as a FRACTION of
+    notional, bucketed by price (P1 rebuild).
+
+    The old flat 5 bps was 1-2 orders of magnitude too low for the sub-$5
+    microcaps this strategy trades: spread + slippage + market impact run
+    100-300 bps+ round-trip there (a $0.05 spread on a $5 stock is a 1% round
+    trip BEFORE any impact). Cost scales with 1/price because cheaper names have
+    wider relative spreads. This is the dominant reason small-cap catalyst
+    chasing rarely nets out — making it explicit is the whole point.
+    """
+    try:
+        px = float(price)
+    except (TypeError, ValueError):
+        px = 0.0
+    if px <= 0:
+        return 0.040
+    if px < 1:
+        return 0.040    # 400 bps — sub-$1
+    if px < 3:
+        return 0.030    # 300 bps
+    if px < 5:
+        return 0.020    # 200 bps
+    if px < 10:
+        return 0.012    # 120 bps
+    if px < 50:
+        return 0.005    # 50 bps
+    return 0.002        # 20 bps — liquid large caps
 
 
 @dataclass
@@ -231,6 +273,7 @@ def _fetch_candidates(cfg: BacktestConfig) -> list[dict]:
               AND (ss.model_p_5d >= ? OR ss.model_p_5d <= ?)
               AND COALESCE(ss.source_weight,0) >= ?
               AND so.return_5d_pct IS NOT NULL
+              AND COALESCE(so.data_corrupt, 0) = 0
               AND so.return_5d_pct BETWEEN -50 AND 50
               AND so.price_at_flag > 0
               {factual_clause}
@@ -275,14 +318,29 @@ def _simulate_stock_trade(cand, cfg, equity, direction, entry, realized_pct) -> 
     # Bracket trip math:
     tp_threshold = p.tp_atr_mult * atr_pct       # e.g., 2.5 * 0.02 = 0.05
     sl_threshold = p.sl_atr_mult * atr_pct       # e.g., 1.5 * 0.02 = 0.03
-    if realized_pct >= tp_threshold:
+    # Partial PATH correction (P1 rebuild): without intraday bars we can't know
+    # the true path, but the 1-day return reveals whether the stop was breached
+    # EARLY. If day-1 already hit the stop, we were stopped out then and cannot
+    # ride the 5-day recovery — the single biggest correction to the old
+    # look-ahead that assumed every winner cleanly caught its TP. (Still mildly
+    # optimistic on TP timing; a true fix needs intraday bars.)
+    r1 = cand.get("return_1d_pct")
+    realized_1d = None
+    if r1 is not None:
+        realized_1d = float(r1) / 100.0
+        if direction == "sell":
+            realized_1d = -realized_1d
+    if realized_1d is not None and realized_1d <= -sl_threshold:
+        exit_pct = -sl_threshold          # stopped out on day 1 — can't recover
+    elif realized_pct >= tp_threshold:
         exit_pct = tp_threshold
     elif realized_pct <= -sl_threshold:
         exit_pct = -sl_threshold
     else:
         exit_pct = realized_pct
-    # Slippage hurts every trade
-    exit_pct -= SLIPPAGE_BPS / 10000
+    # Realistic, price-bucketed round-trip cost hits every trade — the dominant
+    # reason small-cap catalyst trades don't net out (see _round_trip_cost_frac).
+    exit_pct -= _round_trip_cost_frac(entry)
 
     # Kelly sizing using TP:SL ratio
     b = tp_threshold / sl_threshold
@@ -347,7 +405,7 @@ def _simulate_option_spread(cand, cfg, equity, direction, entry, realized_pct) -
     total_debit = contracts * max_loss_per_spread
     pnl_usd = total_debit * (spread_pnl_pct / debit_pct)  # scale: -debit -> -total_debit, +max_gain -> +total*gain/loss
     # Slippage proxy: 5bps of notional
-    pnl_usd -= total_debit * (SLIPPAGE_BPS / 10000)
+    pnl_usd -= total_debit * _OPTION_RT_COST_FRAC
     return TradeResult(
         score_id=cand["score_id"], ticker=cand["ticker"], direction=direction,
         scored_date=(cand["scored_at"] or "")[:10],

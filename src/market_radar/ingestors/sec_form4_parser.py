@@ -39,6 +39,7 @@ class Form4Parsed:
     is_officer: bool = False
     is_director: bool = False
     is_10pct: bool = False
+    is_10b5_1: bool = False       # trade under a pre-planned Rule 10b5-1 plan (routine, uninformative)
     officer_title: Optional[str] = None
     period_of_report: Optional[str] = None
     transactions: list[Form4Transaction] = field(default_factory=list)
@@ -105,6 +106,11 @@ def parse_form4_xml(xml_text: str) -> Optional[Form4Parsed]:
     out.is_officer = (_extract(xml_text, "isOfficer") or "0").strip() in {"1", "true", "True"}
     out.is_director = (_extract(xml_text, "isDirector") or "0").strip() in {"1", "true", "True"}
     out.is_10pct = (_extract(xml_text, "isTenPercentOwner") or "0").strip() in {"1", "true", "True"}
+    # 10b5-1 plan: a pre-arranged trading plan makes the trade ROUTINE (scheduled,
+    # uninformative) — the opposite of an opportunistic insider buy (the durable
+    # edge). The literal "10b5-1" appears in the structured flag / footnotes of
+    # plan trades; "rule10b5One false" (no dash-1) is a non-plan trade.
+    out.is_10b5_1 = bool(re.search(r"10b5[\s\-–_]*1\b", xml_text, re.IGNORECASE))
 
     # Walk transactions. The body fetcher's stripped text doesn't preserve
     # <nonDerivativeTransaction> blocks — fields appear in document order

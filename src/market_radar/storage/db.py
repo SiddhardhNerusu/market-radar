@@ -130,6 +130,26 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         # price) get quarantined instead of being retried forever — which
         # starved the resolvable recent backlog and kept the model unlabeled.
         ("signal_outcomes", "resolve_attempts", "INTEGER DEFAULT 0"),
+        # P0 P&L-truth rebuild (2026-06-15): the intraday account-equity delta
+        # (equity - prior close) gets its OWN column so it can no longer
+        # masquerade as / overwrite realized_pnl_usd (the closed-trade ledger).
+        # realized_pnl_usd is now written ONLY by _update_daily_pnl, per trade.
+        ("bot_daily_pnl", "equity_delta_intraday_usd", "REAL"),
+        # P1 label hygiene (2026-06-15): flag outcomes with corrupt returns
+        # (sub-$1 anchor division blowups / split artifacts) so training + edge
+        # stats exclude them instead of the old magic ABS(return)<200 band-aid.
+        ("signal_outcomes", "data_corrupt", "INTEGER DEFAULT 0"),
+        # P3 (2026-06-15): tp/loss-halt state columns — previously created by a
+        # runtime ALTER TABLE in live_trader._load_daily_tp_state; moved here so
+        # all schema lives in one migration runner (no runtime schema mutation).
+        ("bot_daily_pnl", "tp_fired", "INTEGER"),
+        ("bot_daily_pnl", "tp_peak_usd", "REAL"),
+        ("bot_daily_pnl", "loss_halt_fired", "INTEGER"),
+        # Near-dup clustering (blueprint #6): SimHash+LSH cluster id on raw_signals.
+        ("raw_signals", "dup_cluster_id", "TEXT"),
+        # Form-4 10b5-1 routine-plan flag (blueprint #5): separates pre-planned
+        # routine trades from opportunistic insider buys (the durable edge).
+        ("insider_transactions", "is_10b5_1", "INTEGER DEFAULT 0"),
     ]
     for table, column, coltype in needed:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -229,6 +249,19 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
             alerted         INTEGER DEFAULT 0
         )
         """,
+        # Daemon health HISTORY (blueprint #8): one row per poll, so we can
+        # compute per-source 7-day uptime AND detect a source that fetches OK but
+        # has silently stopped producing (a broken parser/source).
+        """
+        CREATE TABLE IF NOT EXISTS daemon_health_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            source      TEXT NOT NULL,
+            checked_at  TEXT NOT NULL,
+            success     INTEGER NOT NULL,
+            inserted    INTEGER DEFAULT 0,
+            errors      INTEGER DEFAULT 0
+        )
+        """,
     ]
     for stmt in new_tables_sql:
         try:
@@ -243,6 +276,8 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_earnings_data_ticker ON earnings_data(ticker, report_date DESC)",
         "CREATE INDEX IF NOT EXISTS idx_attention_data_ticker ON attention_data(ticker, observed_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_inst_holdings_ticker ON institutional_holdings(ticker, quarter_end DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_dhh_source ON daemon_health_history(source, id DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_raw_signals_dup_cluster ON raw_signals(dup_cluster_id)",
     ]
     for idx in new_indices:
         try:
@@ -431,3 +466,67 @@ def record_daemon_health(
             """,
             (source, now, error),
         )
+
+
+# ---------------------------------------------------------------------------
+# Daemon health history + stalled-source detection (blueprint #8)
+# ---------------------------------------------------------------------------
+
+
+def record_daemon_health_history(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    success: bool,
+    inserted: int = 0,
+    errors: int = 0,
+) -> None:
+    """Append one poll-outcome row. Powers per-source uptime + stalled detection."""
+    conn.execute(
+        "INSERT INTO daemon_health_history (source, checked_at, success, inserted, errors) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (source, utc_now(), 1 if success else 0, int(inserted or 0), int(errors or 0)),
+    )
+
+
+def source_uptime_7d(conn: sqlite3.Connection) -> list[dict]:
+    """Per-source success rate + insert volume over the trailing 7 days."""
+    rows = conn.execute(
+        """
+        SELECT source, COUNT(*) AS polls,
+               ROUND(100.0 * SUM(success) / COUNT(*), 1) AS uptime_pct,
+               SUM(inserted) AS inserted_7d
+        FROM daemon_health_history
+        WHERE checked_at >= strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', '-7 days'))
+        GROUP BY source
+        ORDER BY uptime_pct ASC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def stalled_sources(conn: sqlite3.Connection, *, min_polls: int = 10) -> list[str]:
+    """Sources that fetched OK but inserted NOTHING for the last ``min_polls``
+    consecutive polls, yet DID produce earlier — a known producer that silently
+    stopped (broken parser/source). Sources that simply never produce are NOT
+    flagged. Blueprint #8."""
+    out: list[str] = []
+    srcs = [r["source"] for r in conn.execute(
+        "SELECT DISTINCT source FROM daemon_health_history").fetchall()]
+    for src in srcs:
+        recent = conn.execute(
+            "SELECT success, inserted FROM daemon_health_history "
+            "WHERE source=? ORDER BY id DESC LIMIT ?",
+            (src, int(min_polls)),
+        ).fetchall()
+        if len(recent) < min_polls:
+            continue
+        if not all(r["success"] == 1 and (r["inserted"] or 0) == 0 for r in recent):
+            continue
+        ever_produced = conn.execute(
+            "SELECT 1 FROM daemon_health_history WHERE source=? AND inserted>0 LIMIT 1",
+            (src,),
+        ).fetchone()
+        if ever_produced:
+            out.append(src)
+    return out

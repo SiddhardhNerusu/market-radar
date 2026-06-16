@@ -58,7 +58,8 @@ log = logging.getLogger("marketradar.daemon")
 # ---------------------------------------------------------------------------
 
 DEFAULTS = {
-    "sec_edgar_seconds":   5 * 60,
+    "sec_edgar_seconds":   60,          # stub-first ingest (no HTTP in poll loop)
+    "sec_hydrate_seconds": 20,          # out-of-band SEC body hydration (latency fix)
     "rss_news_seconds":    3 * 60,
     "alpaca_news_seconds": 30,          # catalyst firehose — tightened 60->30 for latency
     "halts_seconds":       60,          # Nasdaq trading-halt feed — real-time bang detector
@@ -74,6 +75,10 @@ DEFAULTS = {
     "ml_predict_seconds":  60,
     "llm_classify_seconds": 45,         # tightened 90->45 — LLM classify is on the catalyst critical path
     "price_action_seconds": 60,
+    "health_check_seconds": 30 * 60,    # stalled-source detector (blueprint #8)
+    "finra_short_interest_seconds": 12 * 60 * 60,  # FINRA bi-monthly short interest (#5)
+    "clinicaltrials_seconds": 8 * 60 * 60,         # ClinicalTrials.gov v2 readouts (#5)
+    "near_dup_seconds": 6 * 60 * 60,               # SimHash near-dup re-cluster (#6)
 }
 
 
@@ -116,7 +121,14 @@ def _safe(name: str, fn):
 
 
 def _job_sec_edgar() -> None:
-    _cached("sec_edgar", SecEdgarIngestor).poll()
+    # Stub-first (blueprint #2 latency fix): fetch_bodies=False keeps ALL HTTP
+    # out of the poll loop so the SQLite writer is never held across the network.
+    # Bodies are filled out-of-band by _job_sec_hydrate below.
+    _cached("sec_edgar", lambda: SecEdgarIngestor(fetch_bodies=False)).poll()
+
+def _job_sec_hydrate() -> None:
+    from .ingestors.sec_hydrate import hydrate_sec_bodies
+    hydrate_sec_bodies()
 
 def _job_rss_news() -> None:
     _cached("rss_news", RssNewsIngestor).poll()
@@ -165,6 +177,14 @@ def _job_earnings_calendar() -> None:
     _cached("earnings_calendar", EarningsCalendarIngestor).poll()
 
 def _job_t212_snap() -> None:
+    # DEAD PATH (P3 hardening 2026-06-15): T212 is a READ-ONLY snapshot with NO
+    # execution adapter wired (see module docstring) — it polls LIVE-MONEY
+    # credentials on a timer for a path that never trades. Disabled unless the
+    # operator explicitly opts in via ENABLE_T212_SNAPSHOT, so live-money creds
+    # aren't exercised for nothing.
+    import os as _os
+    if _os.getenv("ENABLE_T212_SNAPSHOT", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
     if not CONFIG.has_t212:
         return
     snapshot_t212()
@@ -228,6 +248,61 @@ def _job_ml_retrain() -> None:
         log.exception("[ml_retrain] failed: %s", exc)
 
 
+# Throttle health alerts to once/source/day.
+_HEALTH_ALERTED_ON: dict = {}
+
+
+def _job_health_check() -> None:
+    """Alert on sources that fetch OK but have silently STOPPED producing
+    (blueprint #8 — a broken parser/source). Throttled once/source/day."""
+    from datetime import date as _date
+    from .storage import get_connection
+    from .storage.db import stalled_sources
+    today = _date.today().isoformat()
+    with get_connection() as conn:
+        stalled = stalled_sources(conn)
+    for src in stalled:
+        if _HEALTH_ALERTED_ON.get(src) == today:
+            continue
+        _HEALTH_ALERTED_ON[src] = today
+        log.error("[health] source '%s' fetched OK but produced 0 signals for many "
+                  "consecutive polls — likely broken", src)
+        try:
+            from .notifications.realtime import TradeAlert, notify_trade
+            notify_trade(TradeAlert(
+                kind="ALERT", symbol="DAEMON",
+                extra=f"source '{src}' stalled — fetching OK but producing 0 signals "
+                      f"(likely a broken parser/source)"))
+        except Exception:  # noqa: BLE001 — never let alerting crash the job
+            pass
+
+
+def _job_finra_short_interest() -> None:
+    """FINRA consolidated short interest -> short_interest table (blueprint #5).
+    Public, no-auth; idempotent UPSERT keyed on (ticker, report_date)."""
+    from .ingestors.finra_short_interest import FinraShortInterestIngestor
+    _cached("finra_short_interest", FinraShortInterestIngestor).poll()
+
+
+def _job_clinicaltrials() -> None:
+    """ClinicalTrials.gov v2 Phase 2/3 readouts -> catalysts (blueprint #5).
+    Public API, best-effort sponsor->ticker. Never raises."""
+    from .ingestors.clinicaltrials import ClinicalTrialsIngestor
+    _cached("clinicaltrials", ClinicalTrialsIngestor).poll()
+
+
+def _job_near_dup() -> None:
+    """Re-cluster trailing-14d raw_signals into near-dup groups (SimHash+LSH,
+    blueprint #6). Runs the standalone backfill in a subprocess so the heavy
+    clustering stays out of the scheduler thread."""
+    import subprocess
+    subprocess.run(
+        [sys.executable, str(CONFIG.project_root / "scripts" / "backfill_near_dup.py"),
+         "--days", "14"],
+        check=False, timeout=900,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Daemon entry point
 # ---------------------------------------------------------------------------
@@ -277,6 +352,7 @@ def build_scheduler() -> BackgroundScheduler:
 
     jobs = [
         ("sec_edgar",      _job_sec_edgar,      DEFAULTS["sec_edgar_seconds"]),
+        ("sec_hydrate",    _job_sec_hydrate,    DEFAULTS["sec_hydrate_seconds"]),
         ("rss_news",       _job_rss_news,       DEFAULTS["rss_news_seconds"]),
         ("alpaca_news",    _job_alpaca_news,    DEFAULTS["alpaca_news_seconds"]),
         ("halts",          _job_halts,          DEFAULTS["halts_seconds"]),
@@ -296,6 +372,10 @@ def build_scheduler() -> BackgroundScheduler:
         ("ml_predict",     _job_ml_predict,     DEFAULTS["ml_predict_seconds"]),
         ("llm_classify",   _job_llm_classify,   DEFAULTS["llm_classify_seconds"]),
         ("price_action",   _job_price_action,   DEFAULTS["price_action_seconds"]),
+        ("health_check",   _job_health_check,   DEFAULTS["health_check_seconds"]),
+        ("finra_short_int", _job_finra_short_interest, DEFAULTS["finra_short_interest_seconds"]),
+        ("clinicaltrials", _job_clinicaltrials, DEFAULTS["clinicaltrials_seconds"]),
+        ("near_dup",       _job_near_dup,       DEFAULTS["near_dup_seconds"]),
     ]
     for i, (name, fn, interval) in enumerate(jobs):
         sched.add_job(

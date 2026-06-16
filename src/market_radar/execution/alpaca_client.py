@@ -413,7 +413,7 @@ class AlpacaClient:
                     "start": start,
                     "end": end,
                     "limit": limit,
-                    "adjustment": "raw",
+                    "adjustment": "all",  # split/div-adjusted (P1): kills phantom split returns in outcome labels
                     "feed": "iex",
                 },
                 base=self.data_base_url,

@@ -73,7 +73,7 @@ class Config:
 
     # Risk infrastructure (see src/market_radar/risk/manager.py)
     risk_daily_loss_cap_usd: float = 200.0
-    risk_max_gross_exposure_usd: float = 2000.0
+    risk_max_gross_exposure_usd: float = 6000.0
     risk_max_position_pct: float = 5.0
     risk_max_sector_pct: float = 25.0
     risk_max_daily_trades: int = 10
@@ -98,6 +98,24 @@ class Config:
     # peak, halt all trading and require manual review. Catches structural
     # issues (broken strategy, bad config) before they compound.
     risk_monthly_drawdown_usd: float = 2000.0
+
+    # ---- Order-gateway hard backstops (P0 safety rebuild, 2026-06-15) -------
+    # Enforced by execution/order_gateway.py on EVERY submit, independent of any
+    # equity override or sizing multiplier. These are catastrophe backstops, NOT
+    # the primary sizer (that stays in sizer.py / risk.manager). They exist
+    # because the 2026-06-10 TRDA short reached ~$90k notional on a ~$6.3k book.
+    #   hard_order_notional: a SINGLE order can never exceed this $ notional.
+    #   per_symbol_notional: a single NEW position can never exceed this (0 =>
+    #                        fall back to hard_order_notional).
+    #   live_allow_stock_shorts: equities are LONG-ONLY unless this is set.
+    risk_hard_order_notional_usd: float = 2500.0
+    risk_per_symbol_notional_usd: float = 0.0
+    live_allow_stock_shorts: bool = False
+    # All-session equity circuit breaker (the RTH-only loss-stop missed the
+    # after-hours TRDA bleed). If equity drops this many $ below the prior
+    # close, halt NEW opens for the day + alert, in any session. 0 => derive as
+    # 2x the daily loss cap. Does not liquidate off-hours (avoids bad marks).
+    risk_intraday_equity_stop_usd: float = 0.0
 
     # Real-time notifications (see src/market_radar/notifications/notifier.py)
     telegram_bot_token: str = ""
@@ -158,7 +176,7 @@ def load_config() -> Config:
         db_path=db_path,
         project_root=PROJECT_ROOT,
         risk_daily_loss_cap_usd=_float(os.getenv("RISK_DAILY_LOSS_CAP_USD"), 200.0),
-        risk_max_gross_exposure_usd=_float(os.getenv("RISK_MAX_GROSS_EXPOSURE_USD"), 2000.0),
+        risk_max_gross_exposure_usd=_float(os.getenv("RISK_MAX_GROSS_EXPOSURE_USD"), 6000.0),
         risk_max_position_pct=_float(os.getenv("RISK_MAX_POSITION_PCT"), 5.0),
         risk_max_sector_pct=_float(os.getenv("RISK_MAX_SECTOR_PCT"), 25.0),
         risk_max_daily_trades=_int(os.getenv("RISK_MAX_DAILY_TRADES"), 10),
@@ -170,6 +188,10 @@ def load_config() -> Config:
         risk_max_crypto_exposure_usd=_float(os.getenv("RISK_MAX_CRYPTO_EXPOSURE_USD"), 2000.0),
         risk_max_crypto_exposure_weekend_usd=_float(os.getenv("RISK_MAX_CRYPTO_EXPOSURE_WEEKEND_USD"), 5000.0),
         risk_monthly_drawdown_usd=_float(os.getenv("RISK_MONTHLY_DRAWDOWN_USD"), 2000.0),
+        risk_hard_order_notional_usd=_float(os.getenv("RISK_HARD_ORDER_NOTIONAL_USD"), 2500.0),
+        risk_per_symbol_notional_usd=_float(os.getenv("RISK_PER_SYMBOL_NOTIONAL_USD"), 0.0),
+        live_allow_stock_shorts=_bool(os.getenv("LIVE_ALLOW_STOCK_SHORTS"), False),
+        risk_intraday_equity_stop_usd=_float(os.getenv("RISK_INTRADAY_EQUITY_STOP_USD"), 0.0),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         notify_macos_banner=_bool(os.getenv("NOTIFY_MACOS_BANNER"), True),
@@ -197,6 +219,32 @@ if CONFIG.risk_daily_loss_cap_usd > _SANITY_DAILY_LOSS_MAX:
     )
     import sys as _sys
     _sys.exit(2)
+
+# Coherence validation (P0 rebuild 2026-06-15): refuse to start on configs that
+# silently disable protection. The shipped defaults were incoherent
+# (options_reserve $2500 > gross $2000 => the non-option budget was negative).
+_problems: list[str] = []
+if CONFIG.risk_max_gross_exposure_usd <= 0:
+    _problems.append(
+        f"gross exposure cap must be > 0 (got ${CONFIG.risk_max_gross_exposure_usd:.0f})")
+if CONFIG.risk_options_reserve_usd >= CONFIG.risk_max_gross_exposure_usd:
+    _problems.append(
+        f"options reserve ${CONFIG.risk_options_reserve_usd:.0f} >= gross cap "
+        f"${CONFIG.risk_max_gross_exposure_usd:.0f} => non-option (stock/crypto) budget <= $0")
+if CONFIG.risk_hard_order_notional_usd > CONFIG.risk_max_gross_exposure_usd + 1.0:
+    _problems.append(
+        f"hard order notional ${CONFIG.risk_hard_order_notional_usd:.0f} > gross cap "
+        f"${CONFIG.risk_max_gross_exposure_usd:.0f} => a single order could fill the whole book")
+if CONFIG.risk_daily_loss_cap_usd >= CONFIG.risk_max_gross_exposure_usd:
+    _problems.append(
+        f"daily loss cap ${CONFIG.risk_daily_loss_cap_usd:.0f} >= gross cap "
+        f"${CONFIG.risk_max_gross_exposure_usd:.0f} => loss cap can't bind before full deployment")
+if _problems:
+    for _p in _problems:
+        _log.error("REFUSING TO START (incoherent risk config): %s", _p)
+    import sys as _sys
+    _sys.exit(2)
+
 _log.info(
     "Risk caps loaded: daily_loss=$%.0f gross=$%.0f opt_reserve=$%.0f pos=%.1f%% sector=%.1f%% "
     "trades/day=%d drift_block=%dh min_p=%.2f emergency_stop=%s",

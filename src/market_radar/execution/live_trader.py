@@ -45,6 +45,7 @@ from ..storage import get_connection
 from ..storage.db import utc_now
 from .alpaca_client import AlpacaClient, AlpacaError, BracketOrder
 from .live_risk import LiveRiskManager
+from .order_gateway import CLOSE as GW_CLOSE, OPEN as GW_OPEN, GateCaps, OrderGateway
 from .options import (
     AlpacaOptionsClient,
     OPTIONS_UNDERLYINGS,
@@ -163,13 +164,22 @@ class TraderConfig:
     # bearish, 1.0x neutral, 1.2x bullish).
     use_macro_regime: bool = True
 
-    # Hard-block list of low-edge LLM event_types — these had measured negative
-    # or zero edge on 156k historical outcomes. Saves DB+ML cycles by never
-    # routing them to a trade decision.
+    # Hard-block list of low-edge LLM event_types — NET-NEGATIVE after realistic
+    # round-trip costs on CLEAN data (scripts/edge_screen.py, P2 rebuild
+    # 2026-06-15): m_a_announcement -0.35%, activist -0.45%, passive_5pct -0.45%,
+    # proxy -0.33%, ipo -1.26%, routine_* / material_amend / lawsuit all < 0, and
+    # the 'other' base rate -0.18%. Overridable via LIVE_BLOCKED_EVENT_TYPES.
+    # NOTE: price-action events (event_type LIKE 'pa_%') are NEVER blocked here —
+    # they bypass this filter in _fetch_candidates and remain the research track
+    # (the only buckets with positive in-sample net expectancy, still unproven OOS).
     blocked_event_types: tuple[str, ...] = (
         "other", "proxy_statement", "passive_5pct_stake",
         "ipo_registration", "routine_prospectus", "routine_proxy",
-        "material_event_amend", "activist_position",
+        "material_event_amend", "activist_position", "activist_position_amend",
+        "m_a_announcement", "lawsuit",
+        # Bearish 8-K-derived events (deep-dive avoid-long overlay): never long these.
+        "delisting", "restatement", "bankruptcy", "dilution", "impairment",
+        "debt_distress", "auditor_change",
     )
 
     # Hard-block list of signal SOURCES excluded from TRADING (prefix-matched
@@ -233,6 +243,17 @@ class TraderConfig:
                 ).split(",")
                 if s.strip()
             ),
+            blocked_event_types=tuple(
+                s.strip() for s in os.getenv(
+                    "LIVE_BLOCKED_EVENT_TYPES",
+                    "other,proxy_statement,passive_5pct_stake,ipo_registration,"
+                    "routine_prospectus,routine_proxy,material_event_amend,"
+                    "activist_position,activist_position_amend,m_a_announcement,lawsuit,"
+                    "delisting,restatement,bankruptcy,dilution,impairment,"
+                    "debt_distress,auditor_change",
+                ).split(",")
+                if s.strip()
+            ),
         )
 
 
@@ -251,6 +272,23 @@ class LiveTrader:
         self.cfg = config or TraderConfig.from_env()
         self.alpaca = alpaca or AlpacaClient()
         self.risk = LiveRiskManager(self.alpaca)
+        # P0 safety (2026-06-15): the SINGLE order-submission choke-point. Every
+        # order — entry, refill, exit — routes through self.gateway.submit(),
+        # which enforces reduce-only closes (side/qty from the LIVE position
+        # sign), long-only opens, and absolute gross/per-symbol/hard caps. The
+        # 2026-06-10 TRDA death spiral proved these cannot live only at the entry
+        # risk gate (exits/refills bypassed it and compounded a short to ~$90k).
+        from ..config import CONFIG as _CFG
+        self.gateway = OrderGateway(
+            self.alpaca,
+            GateCaps(
+                gross_cap_usd=_CFG.risk_max_gross_exposure_usd,
+                per_symbol_cap_usd=(_CFG.risk_per_symbol_notional_usd
+                                    or _CFG.risk_hard_order_notional_usd),
+                hard_notional_cap_usd=_CFG.risk_hard_order_notional_usd,
+                allow_stock_shorts=_CFG.live_allow_stock_shorts,
+            ),
+        )
         # Options client only instantiated if enabled (no API calls at startup)
         self.options = AlpacaOptionsClient(self.alpaca) if self.cfg.options_enabled else None
         if self.options is not None:
@@ -351,17 +389,13 @@ class LiveTrader:
     def _load_daily_tp_state(self) -> None:
         """Restore _daily_tp_fired_on / peak from DB so restarts don't reopen
         after we've already locked the day. Uses bot_daily_pnl.tp_fired column
-        (added via migration below)."""
+        (created by the storage/db migration runner at startup)."""
         from datetime import date as _date
         try:
             with get_connection() as conn:
-                # Ensure columns exist (idempotent — silent on already-exist)
-                for col, ctype in [("tp_fired", "INTEGER"), ("tp_peak_usd", "REAL"),
-                                   ("loss_halt_fired", "INTEGER")]:
-                    try:
-                        conn.execute(f"ALTER TABLE bot_daily_pnl ADD COLUMN {col} {ctype}")
-                    except Exception:  # noqa: BLE001
-                        pass
+                # tp_fired / tp_peak_usd / loss_halt_fired are created by the
+                # migration runner (storage/db._migrate_columns), which init_db()
+                # runs at startup — no runtime ALTER TABLE here (P3 hardening).
                 row = conn.execute(
                     "SELECT tp_fired, tp_peak_usd, loss_halt_fired, realized_pnl_usd FROM bot_daily_pnl WHERE trading_date=?",
                     (_us_eastern_date().isoformat(),),
@@ -548,45 +582,77 @@ class LiveTrader:
             log.warning("_reconcile_option_spreads failed: %s", exc)
 
     def _reconcile_realized_pnl(self, account) -> None:
-        """Sync bot_daily_pnl.realized to match Alpaca's intraday truth.
+        """Record Alpaca's intraday EQUITY DELTA into its own column — and
+        alert when it diverges from the closed-trade ledger.
 
-        Alpaca's account equity minus last_equity is the authoritative
-        intraday P&L. Subtract current unrealized to get realized. Sync
-        both directions when the gap exceeds $1 — the math is invariant
-        under position reopen, so downward sync is safe and necessary
-        for losses + external closes (cleanup scripts, EOD retries) to
-        appear in the daily report.
+        FIXED 2026-06-15 (P0 P&L-truth rebuild). This method previously
+        OVERWROTE bot_daily_pnl.realized_pnl_usd every 30s loop with
+        ``(equity - last_equity) - unrealized``. That is NOT realized trade
+        P&L — ``last_equity`` is yesterday's close, so the figure folds in
+        overnight gaps and unrealized swings — and because reconcile ran
+        last each loop it clobbered the genuine per-trade sum written by
+        ``_update_daily_pnl``. It is exactly why bot_daily_pnl showed +$840.93
+        on 2026-06-11 with 0 wins, and why the ~$6,112 TRDA loss never appeared
+        in the trade ledger.
+
+        Now: realized_pnl_usd is written ONLY by ``_update_daily_pnl`` (one row
+        per closed trade). The intraday equity delta is stored in its own,
+        clearly non-authoritative column (``equity_delta_intraday_usd``) for
+        visibility, and we emit a reconcile-gap WARNING when the broker-implied
+        realized diverges from the ledger — the signal that would have surfaced
+        the TRDA loss within a day. The daily-loss kill-switch reads Alpaca
+        equity directly (live_risk), independent of this column.
         """
         try:
             positions = self.alpaca.get_positions()
             alpaca_intraday = float(account.equity - account.last_equity)
             current_unreal = sum(float(p.unrealized_pl) for p in positions)
-            true_realized = alpaca_intraday - current_unreal
+            realized_implied = alpaca_intraday - current_unreal  # for the gap alert only
             eastern_date_iso = _us_eastern_date().isoformat()
             with get_connection() as conn:
+                # Write the equity delta to its OWN column. Never touches
+                # realized_pnl_usd / trades_count / wins / losses.
+                conn.execute(
+                    """INSERT INTO bot_daily_pnl
+                       (trading_date, realized_pnl_usd, trades_count, wins, losses,
+                        largest_win, largest_loss, updated_at, equity_delta_intraday_usd)
+                       VALUES (?, 0, 0, 0, 0, 0, 0, ?, ?)
+                       ON CONFLICT(trading_date) DO UPDATE SET
+                         equity_delta_intraday_usd = excluded.equity_delta_intraday_usd,
+                         updated_at = excluded.updated_at""",
+                    (eastern_date_iso, utc_now(), alpaca_intraday),
+                )
                 row = conn.execute(
                     "SELECT realized_pnl_usd FROM bot_daily_pnl WHERE trading_date=?",
                     (eastern_date_iso,),
                 ).fetchone()
-                current = float(row[0]) if row else 0.0
-                if abs(true_realized - current) > 1.0:
-                    delta = true_realized - current
-                    conn.execute(
-                        """INSERT INTO bot_daily_pnl
-                           (trading_date, realized_pnl_usd, trades_count, wins, losses,
-                            largest_win, largest_loss, updated_at)
-                           VALUES (?, ?, 0, 0, 0, 0, 0, ?)
-                           ON CONFLICT(trading_date) DO UPDATE SET
-                             realized_pnl_usd = ?,
-                             updated_at = excluded.updated_at""",
-                        (eastern_date_iso, true_realized, utc_now(), true_realized),
+                ledger_realized = float(row[0]) if row and row[0] is not None else 0.0
+                gap = realized_implied - ledger_realized
+                # A large gap means closed trades happened that the ledger never
+                # booked (e.g. an extended-hours / non-bracket exit) — an UNBOOKED
+                # EXIT. This is the blind spot that hid the TRDA loss; surface it.
+                if abs(gap) > 50.0:
+                    log.warning(
+                        "[reconcile] P&L GAP $%+.2f — Alpaca implies realized ~$%.2f but "
+                        "ledger booked $%.2f for %s (possible UNBOOKED EXIT / non-bracket close)",
+                        gap, realized_implied, ledger_realized, eastern_date_iso,
                     )
-                    log.info(
-                        "[reconcile] realized P&L synced: $%.2f → $%.2f (delta $%+.2f)",
-                        current, true_realized, delta,
-                    )
+                    # Out-of-band alert (throttled once/day) — a log line is easy
+                    # to miss, and this gap is exactly what hid the TRDA loss.
+                    if getattr(self, "_reconcile_gap_alerted_on", None) != eastern_date_iso:
+                        self._reconcile_gap_alerted_on = eastern_date_iso
+                        try:
+                            from ..notifications.realtime import TradeAlert, notify_trade
+                            notify_trade(TradeAlert(
+                                kind="ALERT", symbol="PNL_GAP",
+                                extra=(f"reconcile gap ${gap:+.0f}: ledger ${ledger_realized:+.0f} "
+                                       f"vs Alpaca-implied ${realized_implied:+.0f} — possible "
+                                       f"unbooked exit"),
+                            ))
+                        except Exception:  # noqa: BLE001 — never let alerting break the loop
+                            pass
         except Exception as exc:  # noqa: BLE001
-            log.warning("realized P&L reconcile failed: %s", exc)
+            log.warning("equity-delta reconcile failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Startup reconciliation — discover orphaned Alpaca positions/orders
@@ -925,6 +991,41 @@ class LiveTrader:
         # one day would silently block all new entries forever after.
         if getattr(self, "_daily_loss_halt_on", None) != _roll_date.today():
             self._daily_loss_halt_on = None
+
+        # Step 2c0: ALL-SESSION equity circuit breaker. The daily loss-stop below
+        # is RTH-only (it liquidates, which is unsafe at illiquid off-hours marks),
+        # but the 2026-06-10 TRDA bleed happened AFTER HOURS. This runs every loop
+        # in every session, reads Alpaca equity directly (never the DB P&L column),
+        # and — if equity has fallen more than the hard stop below the prior close —
+        # HALTS new opens for the day + alerts. It does not liquidate off-hours; the
+        # order gateway already makes a runaway structurally impossible, and during
+        # RTH the loss-stop below will de-risk losers once this flag is set.
+        try:
+            from ..config import CONFIG as _CFG_CB
+            _hard_stop = float(getattr(_CFG_CB, "risk_intraday_equity_stop_usd", 0.0) or 0.0)
+            if _hard_stop <= 0:
+                _hard_stop = 2.0 * abs(float(_CFG_CB.risk_daily_loss_cap_usd or 0))
+            _equity_drop = float(account.last_equity) - float(account.equity)
+            if (_hard_stop > 0 and float(account.last_equity) > 0
+                    and _equity_drop >= _hard_stop
+                    and getattr(self, "_daily_loss_halt_on", None) != _roll_date.today()):
+                self._daily_loss_halt_on = _roll_date.today()
+                self._persist_loss_halt_state()
+                log.error(
+                    "🛑 EQUITY CIRCUIT BREAKER: equity -$%.0f vs prior close "
+                    "(>= hard stop $%.0f) — halting NEW opens for the day (all sessions).",
+                    _equity_drop, _hard_stop,
+                )
+                try:
+                    self._maybe_alert_halt(
+                        "daily_loss_cap",
+                        f"equity -${_equity_drop:.0f} vs prior close (>= ${_hard_stop:.0f}) "
+                        f"— all-session circuit breaker halted new opens",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as exc:  # noqa: BLE001 — never crash the loop on the breaker
+            log.exception("Equity circuit breaker check failed: %s", exc)
 
         # Step 2c: EOD flatten — close stock positions before market close
         try:
@@ -2270,11 +2371,13 @@ class LiveTrader:
                 fractional_qty = round(sized.notional_usd / entry, 6) if entry > 0 else sized.qty
                 if fractional_qty <= 0:
                     raise AlpacaError(f"crypto fractional qty {fractional_qty} <= 0")
-                simple = self.alpaca.submit_simple_order(
-                    symbol=symbol, side=direction, qty=fractional_qty,
-                    order_type="market", time_in_force="gtc",
-                    client_order_id=client_order_id,
+                simple = self.gateway.submit(
+                    intent=GW_OPEN, symbol=symbol, side=direction, qty=fractional_qty,
+                    ref_price=entry, order_type="market", time_in_force="gtc",
+                    client_order_id=client_order_id, positions=positions,
                 )
+                if simple is None:
+                    raise AlpacaError("order gateway refused entry (gross/hard cap or long-only)")
                 placed_id = simple.id
                 placed_qty = fractional_qty
                 placed_kind = "simple_market_crypto"
@@ -2289,12 +2392,14 @@ class LiveTrader:
                     # server-side bracket to protect this position — the poller is it).
                     buf = 1.003 if direction == "buy" else 0.997
                     limit_px = round(float(entry) * buf, 2)
-                    simple = self.alpaca.submit_simple_order(
-                        symbol=symbol, side=direction, qty=sized.qty,
-                        order_type="limit", limit_price=limit_px,
+                    simple = self.gateway.submit(
+                        intent=GW_OPEN, symbol=symbol, side=direction, qty=sized.qty,
+                        ref_price=entry, order_type="limit", limit_price=limit_px,
                         time_in_force="day", extended_hours=True,
-                        client_order_id=client_order_id,
+                        client_order_id=client_order_id, positions=positions,
                     )
+                    if simple is None:
+                        raise AlpacaError("order gateway refused entry (gross/hard cap or long-only)")
                     placed_id = simple.id
                     placed_qty = sized.qty
                     placed_kind = "stock_polled"
@@ -2304,11 +2409,13 @@ class LiveTrader:
                     # trailing take-profit in _poll_stock_exits applies — no fixed-TP bracket
                     # that would cap a volatile "bang". Hard SL + trailing TP live in the
                     # poller (the only stop), so the bot must stay alive (always-on).
-                    simple = self.alpaca.submit_simple_order(
-                        symbol=symbol, side=direction, qty=sized.qty,
-                        order_type="market", time_in_force="day",
-                        client_order_id=client_order_id,
+                    simple = self.gateway.submit(
+                        intent=GW_OPEN, symbol=symbol, side=direction, qty=sized.qty,
+                        ref_price=entry, order_type="market", time_in_force="day",
+                        client_order_id=client_order_id, positions=positions,
                     )
+                    if simple is None:
+                        raise AlpacaError("order gateway refused entry (gross/hard cap or long-only)")
                     placed_id = simple.id
                     placed_qty = sized.qty
                     placed_kind = "stock_polled"
@@ -2691,15 +2798,24 @@ class LiveTrader:
             coid = f"mr-refill-{score_id}-{int(now_ts * 1000)}"
             try:
                 if market_open:
-                    new = self.alpaca.submit_simple_order(
-                        symbol=sym, side=direction, qty=remainder,
-                        order_type="market", time_in_force="day", client_order_id=coid)
+                    new = self.gateway.submit(
+                        intent=GW_OPEN, symbol=sym, side=direction, qty=remainder,
+                        ref_price=cur, order_type="market", time_in_force="day",
+                        client_order_id=coid, positions=positions)
                 else:
                     buf = 1.005 if direction == "buy" else 0.995
-                    new = self.alpaca.submit_simple_order(
-                        symbol=sym, side=direction, qty=remainder,
-                        order_type="limit", limit_price=round(cur * buf, 2),
-                        time_in_force="day", extended_hours=True, client_order_id=coid)
+                    new = self.gateway.submit(
+                        intent=GW_OPEN, symbol=sym, side=direction, qty=remainder,
+                        ref_price=cur, order_type="limit", limit_price=round(cur * buf, 2),
+                        time_in_force="day", extended_hours=True, client_order_id=coid, positions=positions)
+                if new is None:
+                    # Gateway refused the refill (long-only / caps). The original
+                    # order was already canceled above, so mark unfilled — do NOT
+                    # stack a raw bypass submit (that path caused the TRDA spiral).
+                    log.warning("[fill-retry] %s gateway refused re-submit (caps/long-only) "
+                                "— marking unfilled", sym)
+                    _mark(r["id"], "unfilled", "gateway_blocked")
+                    continue
                 self._stock_fill_retry_ts[score_id] = now_ts
                 self._stock_fill_retry_count[score_id] = (
                     self._stock_fill_retry_count.get(score_id, 0) + 1)
@@ -2921,19 +3037,24 @@ class LiveTrader:
                 qty = abs(pos_qty)
                 coid = f"mr-sx-{tp_sl['score_id']}-{int(now_ts * 1000)}"
                 if market_open:
-                    self.alpaca.submit_simple_order(
-                        symbol=p.symbol, side=close_side, qty=qty,
-                        order_type="market", time_in_force="day",
-                        client_order_id=coid,
+                    _o = self.gateway.submit(
+                        intent=GW_CLOSE, symbol=p.symbol, side=close_side, qty=qty,
+                        ref_price=current_price, order_type="market", time_in_force="day",
+                        client_order_id=coid, positions=positions,
                     )
                 else:
                     cbuf = 0.997 if close_side == "sell" else 1.003
-                    self.alpaca.submit_simple_order(
-                        symbol=p.symbol, side=close_side, qty=qty,
-                        order_type="limit", limit_price=round(current_price * cbuf, 2),
+                    _o = self.gateway.submit(
+                        intent=GW_CLOSE, symbol=p.symbol, side=close_side, qty=qty,
+                        ref_price=current_price, order_type="limit",
+                        limit_price=round(current_price * cbuf, 2),
                         time_in_force="day", extended_hours=True,
-                        client_order_id=coid,
+                        client_order_id=coid, positions=positions,
                     )
+                if _o is None:
+                    # Gateway refused (already flat / guard tripped). Don't book a
+                    # phantom exit; the next loop re-evaluates against live state.
+                    continue
                 self._stock_exit_attempts[sym] = now_ts
                 entry = float(p.avg_entry_price)
                 pnl = ((current_price - entry) if direction == "buy"
@@ -3445,12 +3566,15 @@ class LiveTrader:
                 )
                 if cur.rowcount == 0:
                     return None  # already booked by another path — no dup
-                # NOTE: do NOT touch bot_daily_pnl here. _reconcile_realized_pnl
-                # owns the daily total (authoritative Alpaca equity-delta, set
-                # every loop). Adding realized here would transiently double-
-                # count (could make the daily_loss_cap gate spuriously block for
-                # one iteration). This booking's job is only the per-spread
-                # realized_pnl_usd that the learning loop reads.
+                # Book into the daily trade ledger too. FIXED 2026-06-15: the old
+                # comment claimed _reconcile_realized_pnl "owns the daily total"
+                # via the Alpaca equity delta — but the P0 P/L-truth fix made
+                # reconcile write ONLY equity_delta_intraday_usd, so option-spread
+                # P/L was silently dropped from bot_daily_pnl.realized_pnl_usd
+                # (ledger read +$64 while true realized incl. options was -$1,051).
+                # The `realized_pnl_usd IS NULL` guard on the UPDATE above means
+                # this booking fires EXACTLY ONCE per spread — no double-count.
+                self._update_daily_pnl(conn, realized)
             log.info(
                 "OPT P&L booked [%s] spread %d %s: entry=$%.2f exit=$%.2f "
                 "× %d → realized $%+.2f (%.1f%%)",

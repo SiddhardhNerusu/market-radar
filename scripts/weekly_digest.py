@@ -143,7 +143,7 @@ def main() -> int:
         ).fetchone()
 
     # Aggregate
-    total_realized = sum(float(d["realized"] or 0) for d in daily)
+    total_realized = sum(float(d["realized"] or 0) for d in daily)  # booked ledger
     total_trades = sum(int(d["trades_count"] or 0) for d in daily)
     total_wins = sum(int(d["wins"] or 0) for d in daily)
     total_losses = sum(int(d["losses"] or 0) for d in daily)
@@ -151,21 +151,28 @@ def main() -> int:
                 if (total_wins + total_losses) > 0 else 0)
     eq_s = float(equity_start[0]) if equity_start else 0
     eq_e = float(equity_end[0]) if equity_end else 0
-    eq_delta = eq_e - eq_s
-    daily_avg = total_realized / max(len(daily), 1)
-    # GBP convert (rough, 1 USD = 0.80 GBP — adjust if needed)
-    usd_to_gbp = 0.80
+    eq_delta = eq_e - eq_s  # AUTHORITATIVE weekly P/L (Alpaca equity curve)
+    # P1 P/L-truth fix: judge the £150/day target on the TRUE account change, not
+    # the trade ledger — the ledger is blind to unbooked exits (the 2026-06-10
+    # TRDA loss never produced a booked row). Show the ledger + reconcile gap too.
+    usd_to_gbp = 0.80  # rough; adjust if needed
+    daily_avg = eq_delta / max(len(daily), 1)
     daily_avg_gbp = daily_avg * usd_to_gbp
-    total_gbp = total_realized * usd_to_gbp
+    total_gbp = eq_delta * usd_to_gbp
+    ledger_gbp = total_realized * usd_to_gbp
+    reconcile_gap = eq_delta - total_realized
 
     # Build the report
     lines = [
         f"📊 <b>WEEKLY DIGEST — {week_start} → {today_iso}</b>",
         "",
-        f"<b>Total realized: ${total_realized:+.2f} (£{total_gbp:+.2f})</b>",
-        f"<b>Daily avg: ${daily_avg:+.2f} (£{daily_avg_gbp:+.2f})</b>",
+        f"<b>True account P/L (equity Δ): ${eq_delta:+.2f} (£{total_gbp:+.2f})</b>",
+        f"<b>Daily avg: ${daily_avg:+.2f} (£{daily_avg_gbp:+.2f})</b> (judged on equity Δ)",
         f"Target: £150/day = £1,050/week",
         f"Hit rate vs target: {'✅ ABOVE' if daily_avg_gbp >= 150 else '❌ BELOW'}",
+        f"Booked closed-trade P/L (ledger): ${total_realized:+.2f} (£{ledger_gbp:+.2f})",
+        f"{'⚠️ ' if abs(reconcile_gap) > 50 else ''}Reconcile gap "
+        f"(unbooked exits / unrealized): ${reconcile_gap:+.2f}",
         "",
         f"📈 Equity: ${eq_s:,.0f} → ${eq_e:,.0f} (Δ ${eq_delta:+,.0f})",
         f"🎯 Win rate: {win_rate:.0f}% ({total_wins}W / {total_losses}L of {total_trades} closed)",

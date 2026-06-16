@@ -400,10 +400,13 @@ def _corroboration_count(
     exclude_signal_id: int,
     window_hours: int,
 ) -> int:
-    """Count distinct (source) Tier 1/2 signals on the same ticker in the
-    trailing window. Excludes the signal we're scoring."""
+    """Count distinct STORIES (by content_hash) from Tier 1/2 signals on the same
+    ticker in the trailing window — NOT distinct feeds. Counting feeds let one
+    wire story syndicated across ~8 outlets (or ~30 Google-News topical feeds)
+    inflate "corroboration" 8-30x with zero added information (ingestion deep-dive
+    2026-06-15). Distinct content_hash de-syndicates. Excludes the signal scored."""
     sql = f"""
-        SELECT COUNT(DISTINCT rs.source) AS n
+        SELECT COUNT(DISTINCT COALESCE(rs.content_hash, 'id:' || rs.id)) AS n
         FROM raw_signals rs
         JOIN signal_tickers st ON st.signal_id = rs.id
         WHERE st.ticker = ?

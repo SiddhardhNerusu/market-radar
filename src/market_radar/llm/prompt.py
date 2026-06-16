@@ -76,8 +76,46 @@ Return ONE JSON object with this exact schema. Use null for unknown fields. Be c
   "confidence": float in [0, 1]       // your confidence in this classification overall
 }
 
-Do NOT include any explanation outside the JSON. Output JSON only.
+Call the classify_signal tool with your structured classification. Be conservative — when a genuine event class doesn't clearly apply, set a LOW confidence rather than forcing a label.
 """
+
+
+# Forced tool-use schema (blueprint #3 L137): forcing this tool call guarantees a
+# schema-VALID JSON object — no free-text parsing, no json.loads reject path, no
+# code-fence stripping. The classifier reads block.input directly.
+_EVENT_TYPES = [
+    "m_a_announcement", "m_a_rumor", "earnings_beat", "earnings_miss",
+    "guidance_raise", "guidance_cut", "fda_approval", "fda_rejection",
+    "analyst_upgrade", "analyst_downgrade", "insider_buy", "insider_sell",
+    "activist_position", "buyback", "dividend", "leadership_change", "lawsuit",
+    "ipo_registration", "macro", "stock_split", "short_seller_report",
+    "clinical_trial_result", "contract_award", "layoffs", "product_launch",
+    "earnings_announcement", "other",
+]
+
+CLASSIFY_TOOL = {
+    "name": "classify_signal",
+    "description": "Return the structured classification of the financial content.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "event_type": {"type": "string", "enum": _EVENT_TYPES},
+            "sentiment": {"type": "number", "minimum": -1, "maximum": 1},
+            "sentiment_magnitude": {"type": "number", "minimum": 0, "maximum": 1},
+            "factual": {"type": "integer", "enum": [0, 1]},
+            "tickers_mentioned": {"type": "array", "items": {"type": "string"}},
+            "extracted_fields": {"type": "object"},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "required": ["event_type", "sentiment", "sentiment_magnitude", "factual",
+                     "tickers_mentioned", "extracted_fields", "confidence"],
+    },
+}
+
+# Below this confidence the label is untrusted — bucketed so it does NOT pass the
+# trade gate but is re-queueable.
+LOW_CONFIDENCE_THRESHOLD = 0.55
+LOW_CONFIDENCE_EVENT = "unclassified_low_confidence"
 
 
 def build_user_prompt(*, title: str | None, body: str | None,

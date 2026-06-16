@@ -85,15 +85,15 @@ def main() -> int:
                     """INSERT OR REPLACE INTO insider_transactions
                     (signal_id, ticker, insider_name, transaction_code, shares,
                      price, is_acquired, officer_title, is_officer, is_director,
-                     is_10pct, role_score, report_date, ingested_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     is_10pct, role_score, report_date, ingested_at, is_10b5_1)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (r["signal_id"], parsed.issuer_ticker, parsed.insider_name,
                      tx.transaction_code, tx.shares, tx.price_per_share,
                      1 if tx.is_acquired else 0, parsed.officer_title,
                      int(parsed.is_officer), int(parsed.is_director),
                      int(parsed.is_10pct), parsed.insider_role_score,
                      parsed.period_of_report or r["published_at"][:10] if r["published_at"] else None,
-                     now),
+                     now, int(parsed.is_10b5_1)),
                 )
                 inserted += 1
     log.info("Done. transactions_inserted=%d skipped=%d", inserted, skipped)

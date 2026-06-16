@@ -100,6 +100,7 @@ class ModelPredictor:
         # Read the feature list this model was trained against, so we can
         # subset X correctly if the current FEATURE_NAMES has grown since.
         feature_names: Optional[list[str]] = None
+        meta: Optional[dict] = None
         if meta_path_str:
             try:
                 meta = json.loads(Path(meta_path_str).read_text())
@@ -107,6 +108,32 @@ class ModelPredictor:
                     feature_names = [str(x) for x in meta["feature_names"]]
             except (OSError, json.JSONDecodeError) as exc:
                 log.debug("Failed to read model meta %s: %s", meta_path_str, exc)
+
+        # Load-time quality re-gate (final-audit fix 2026-06-15): train.py's
+        # deploy gate only blocks NEW deploys — a model deployed BEFORE the gate
+        # existed (current.json: val_auc_std=0.169, a fold at 0.476) was still
+        # served here for Kelly sizing with no re-check. Re-validate the persisted
+        # metrics against today's bar and REFUSE to serve a model the system would
+        # not itself deploy → predictions fall back to neutral (no ML / no trade).
+        import os as _os
+        if meta is not None and not _os.getenv("LIVE_ALLOW_UNGATED_MODEL", "").strip():
+            try:
+                _min_auc = float(_os.getenv("ML_MIN_DEPLOY_AUC", "0.53"))
+                _max_std = float(_os.getenv("ML_MAX_FOLD_STD", "0.05"))
+                _auc, _std = meta.get("val_auc"), meta.get("val_auc_std")
+                _bad = []
+                if _auc is not None and float(_auc) < _min_auc:
+                    _bad.append(f"val_auc {float(_auc):.4f} < {_min_auc}")
+                if _std is not None and float(_std) > _max_std:
+                    _bad.append(f"val_auc_std {float(_std):.4f} > {_max_std}")
+                if _bad:
+                    log.error(
+                        "REFUSING to serve deployed model %s — fails today's quality "
+                        "bar (%s). Falling back to neutral (no ML). Override with "
+                        "LIVE_ALLOW_UNGATED_MODEL=1.", version, "; ".join(_bad))
+                    return None
+            except (TypeError, ValueError):
+                pass
 
         log.info("Loaded ML model version=%s from %s (features=%d)",
                  version, model_path,

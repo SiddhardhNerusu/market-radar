@@ -406,6 +406,7 @@ def cmd_edge() -> dict[str, Any]:
             FROM signal_scores ss
             LEFT JOIN signal_outcomes so ON so.score_id = ss.id
             WHERE ss.signal_class IS NOT NULL
+              AND COALESCE(so.data_corrupt, 0) = 0   -- P1: exclude corrupt-label rows
             GROUP BY ss.signal_class
             HAVING COUNT(*) >= 5
             ORDER BY samples DESC
@@ -424,6 +425,7 @@ def cmd_edge() -> dict[str, Any]:
             FROM signal_scores ss
             LEFT JOIN signal_outcomes so ON so.score_id = ss.id
             WHERE ss.event_type IS NOT NULL
+              AND COALESCE(so.data_corrupt, 0) = 0   -- P1: exclude corrupt-label rows
             GROUP BY ss.event_type
             ORDER BY samples DESC
             """
@@ -437,7 +439,8 @@ def cmd_edge() -> dict[str, Any]:
                 COUNT(DISTINCT rs.id) AS signals,
                 COUNT(DISTINCT ss.id) AS scored,
                 ROUND(AVG(ss.composite_score), 2) AS avg_score,
-                ROUND(AVG(so.return_5d_pct), 3) AS avg_5d_return
+                ROUND(AVG(CASE WHEN COALESCE(so.data_corrupt,0)=0
+                               THEN so.return_5d_pct END), 3) AS avg_5d_return
             FROM raw_signals rs
             LEFT JOIN signal_scores ss ON ss.signal_id = rs.id
             LEFT JOIN signal_outcomes so ON so.score_id = ss.id
@@ -506,6 +509,7 @@ def _measured_edge(
         JOIN signal_outcomes so ON so.score_id = ss.id
         WHERE ss.signal_class = ?
           AND so.return_5d_pct IS NOT NULL
+          AND COALESCE(so.data_corrupt, 0) = 0
         """,
         (signal_class,),
     ).fetchone()

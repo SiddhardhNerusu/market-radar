@@ -245,6 +245,13 @@ def classify_pending(*, batch_size: int = 50,
                    ON lc.signal_id = ss.signal_id AND lc.ticker = ss.ticker
             WHERE lc.id IS NULL
               AND rs.source NOT LIKE 'sec_edgar_backfill_%'
+              -- Price-action signals are already-typed (pa_*) DIRECT observations
+              -- that never need LLM classification — and being high-composite they
+              -- CLOGGED the head of this composite-DESC queue, re-filling every
+              -- batch (they're never written, so lc.id stays NULL) and starving
+              -- ~9k real SEC rows behind them (deployed-state audit R1). Exclude
+              -- them so the queue actually advances to classifiable rows.
+              AND rs.source NOT LIKE 'price_action_%'
               AND rs.ingested_at >= strftime('%Y-%m-%dT%H:%M:%SZ', datetime('now', '-2 days'))
               -- Don't classify an un-hydrated SEC stub (RSS metadata only) while
               -- it's young — give the out-of-band hydrate job time to fill the

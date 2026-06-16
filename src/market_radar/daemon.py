@@ -303,6 +303,17 @@ def _job_near_dup() -> None:
     )
 
 
+def _job_daily_assessment() -> None:
+    """Post the honest daily-assessment digest to Telegram (deployed-state audit
+    watch-items: true P&L, edge-day progress vs the 40-day gate, pipeline health,
+    safety events). Subprocess so the queries never block the scheduler thread."""
+    import subprocess
+    subprocess.run(
+        [sys.executable, str(CONFIG.project_root / "scripts" / "daily_assessment.py")],
+        check=False, timeout=180,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Daemon entry point
 # ---------------------------------------------------------------------------
@@ -328,6 +339,9 @@ def configure_logging() -> None:
     )
     # Quiet werkzeug's per-request access log to avoid log spam
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    # apscheduler logs every job execution + "max instances reached" at INFO —
+    # ~25k lines/day that filled the UNROTATED launchd stdout to 228MB (audit R2).
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
     # yfinance emits its own ERROR lines for crypto/index symbols it can't price
     # ("$BTCUSD: possibly delisted", "$ES_F: no timezone found") — ~3,400/run of
     # benign spam that buries real errors. Our price fetcher already catches those
@@ -399,6 +413,15 @@ def build_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     log.info("scheduled %-20s weekly Mon 04:00 UTC", "ml_retrain")
+
+    # Daily honest assessment digest — 21:35 UTC (after the US close).
+    sched.add_job(
+        _safe("daily_assessment", _job_daily_assessment),
+        trigger=CronTrigger(hour=21, minute=35, timezone="UTC"),
+        id="daily_assessment",
+        replace_existing=True,
+    )
+    log.info("scheduled %-20s daily 21:35 UTC", "daily_assessment")
     return sched
 
 

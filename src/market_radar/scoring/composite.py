@@ -45,6 +45,7 @@ from typing import Optional
 
 from datetime import datetime, timezone
 
+from ..ingestors.sec_item_codes import sec_event_type
 from ..storage import get_connection
 from .heuristics import classify_heuristic
 from .impact import impact_for
@@ -177,10 +178,20 @@ def _score_one(
     issuer = raw_payload.get("company_name") or row["author"]
     is_routine = is_routine_filing(form=form, issuer_name=issuer)
 
+    # Deterministic form/item-code event type for SEC filings — the authoritative
+    # classifier for filings (424B*->routine_prospectus, 425->m_a_announcement,
+    # 8-K item codes->typed). Keyword scanning of a filing's legal *body* false-
+    # matches boilerplate (e.g. "soliciting offers to buy these Notes" -> the M&A
+    # pattern's "to buy" -> m_a_announcement at composite 10), so for SEC sources
+    # the form wins over the keyword heuristic. Applied only on the heuristic
+    # path; the LLM rescore path already folds sec_event_type in (llm/classifier).
+    det_event = sec_event_type(form, row["body"]) if (source or "").startswith("sec") else None
+
     # Classification: heuristic by default, OR a caller-supplied one. The LLM
     # pass uses the override (via rescore_with_classification) so its corrected
     # event_type/sentiment actually reaches the trade gate, instead of sitting
     # in a side table the gate never reads.
+    used_heuristic = classification is None
     if classification is None:
         classification = classify_heuristic(
             title=row["title"],
@@ -192,6 +203,10 @@ def _score_one(
         # Override event type — we don't want "M&A" or "material event"
         # tags on routine prospectus filings.
         event_type = routine_event_type(form)
+    elif used_heuristic and det_event:
+        # Trust the deterministic SEC form classification over body-keyword
+        # guesses, so prospectus boilerplate can't mint fake M&A catalysts.
+        event_type = det_event
     else:
         event_type = classification.event_type
 

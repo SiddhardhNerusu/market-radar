@@ -73,11 +73,11 @@ class Config:
 
     # Risk infrastructure (see src/market_radar/risk/manager.py)
     risk_daily_loss_cap_usd: float = 200.0
-    risk_max_gross_exposure_usd: float = 6000.0
+    risk_max_gross_exposure_usd: float = 10000.0
     risk_max_position_pct: float = 5.0
     risk_max_sector_pct: float = 25.0
     risk_max_daily_trades: int = 10
-    risk_max_concurrent_positions: int = 6   # anti pile-on: max distinct open names
+    risk_max_concurrent_positions: int = 12  # diversification ceiling; gross-$/per-name/sector caps are the real governor
     risk_drift_block_hours: int = 24
     risk_min_calibrated_p: float = 0.62
     risk_emergency_stop: bool = False
@@ -176,11 +176,11 @@ def load_config() -> Config:
         db_path=db_path,
         project_root=PROJECT_ROOT,
         risk_daily_loss_cap_usd=_float(os.getenv("RISK_DAILY_LOSS_CAP_USD"), 200.0),
-        risk_max_gross_exposure_usd=_float(os.getenv("RISK_MAX_GROSS_EXPOSURE_USD"), 6000.0),
+        risk_max_gross_exposure_usd=_float(os.getenv("RISK_MAX_GROSS_EXPOSURE_USD"), 10000.0),
         risk_max_position_pct=_float(os.getenv("RISK_MAX_POSITION_PCT"), 5.0),
         risk_max_sector_pct=_float(os.getenv("RISK_MAX_SECTOR_PCT"), 25.0),
         risk_max_daily_trades=_int(os.getenv("RISK_MAX_DAILY_TRADES"), 10),
-        risk_max_concurrent_positions=_int(os.getenv("RISK_MAX_CONCURRENT_POSITIONS"), 6),
+        risk_max_concurrent_positions=_int(os.getenv("RISK_MAX_CONCURRENT_POSITIONS"), 12),
         risk_drift_block_hours=_int(os.getenv("RISK_DRIFT_BLOCK_HOURS"), 24),
         risk_min_calibrated_p=_float(os.getenv("RISK_MIN_CALIBRATED_P"), 0.62),
         risk_emergency_stop=_bool(os.getenv("RISK_EMERGENCY_STOP"), False),

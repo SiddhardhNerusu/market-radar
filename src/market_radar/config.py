@@ -77,7 +77,7 @@ class Config:
     risk_max_position_pct: float = 5.0
     risk_max_sector_pct: float = 25.0
     risk_max_daily_trades: int = 10
-    risk_max_concurrent_positions: int = 12  # diversification ceiling; gross-$/per-name/sector caps are the real governor
+    risk_max_concurrent_positions: int = 12  # 0 = unlimited (pool/per-name/sector + Kelly govern the split); >0 = hard headcount ceiling
     risk_drift_block_hours: int = 24
     risk_min_calibrated_p: float = 0.62
     risk_emergency_stop: bool = False

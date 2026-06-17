@@ -331,7 +331,12 @@ class RiskManager:
                 "Concentration cap: open-position count unavailable — blocking (fail-closed)",
                 "max_concurrent_positions",
             )
-        if current_position_count >= CONFIG.risk_max_concurrent_positions:
+        # 0 (or negative) DISABLES the count cap entirely: capital allocation
+        # (the $-pool gross cap + per-name % + sector %) and the confidence/Kelly
+        # sizer govern how the pool is split, instead of an arbitrary headcount.
+        # The fail-closed-on-None check above still stands (never trade blind).
+        if (CONFIG.risk_max_concurrent_positions > 0
+                and current_position_count >= CONFIG.risk_max_concurrent_positions):
             return RiskDecision(
                 False,
                 f"Concentration cap: {current_position_count} open names "

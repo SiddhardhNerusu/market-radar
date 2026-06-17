@@ -631,7 +631,22 @@ class LiveTrader:
                 # A large gap means closed trades happened that the ledger never
                 # booked (e.g. an extended-hours / non-bracket exit) — an UNBOOKED
                 # EXIT. This is the blind spot that hid the TRDA loss; surface it.
-                if abs(gap) > 50.0:
+                #
+                # BUT realized_implied = (equity - yesterday_close) - current_unreal
+                # mixes baselines: the first term is TODAY's equity delta, the second
+                # is unrealized SINCE ENTRY. A multi-day open winner (e.g. a position
+                # sitting on +$121 unrealized) therefore manufactures a phantom
+                # "realized" figure with zero trades. An unbooked exit can only happen
+                # via a real closing FILL, so gate the alert on actual fills today — a
+                # genuine unbooked exit (the TRDA case this guards) always leaves a
+                # FILL, so the protection still fires when it matters.
+                had_fill_today = True  # fail-safe: if the probe fails, still alert
+                try:
+                    had_fill_today = bool(self.alpaca.list_account_activities(
+                        activity_type="FILL", after=eastern_date_iso))
+                except Exception:  # noqa: BLE001 — never let the fills probe break reconcile
+                    pass
+                if had_fill_today and abs(gap) > 50.0:
                     log.warning(
                         "[reconcile] P&L GAP $%+.2f — Alpaca implies realized ~$%.2f but "
                         "ledger booked $%.2f for %s (possible UNBOOKED EXIT / non-bracket close)",

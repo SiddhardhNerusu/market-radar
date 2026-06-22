@@ -8,16 +8,22 @@ symptom-site patch is not enough; the invariant must live in ONE place.
 
 ROUTED THROUGH THIS GATEWAY (where a short/flip/oversize is possible):
   - stock entry, stock refill, stock RTH/extended-hours exit, crypto entry.
+  - every scheduled stock flatten close: the daily profit-take / loss-stop, the
+    EOD "no overnight holds" flatten, and the rogue-orphan flatten — each routed
+    as intent=CLOSE so it inherits reduce-only-by-live-sign + fail-closed. The
+    rogue-orphan flatten is the literal TRDA flip-and-grow vector, so it MUST go
+    through here, never a raw ``close_position``.
 
 NOT routed (each reduce-only BY CONSTRUCTION — documented exceptions, not gaps):
   - crypto SL/TP exit & flip, the weekend crypto trim: Alpaca spot crypto cannot
     be shorted (CRYPTO-NO-SHORT entry guard), so a held position is always long
     and a close is always a sell-to-close that reduces toward flat.
-  - EOD flatten / daily-flatten / profit-take: close via Alpaca ``close_position``
-    (inherently reduce-only) or an explicit live-sign ``position_intent``.
+  - the option-leg closes inside those flatten paths: submitted with an explicit
+    live-sign ``position_intent`` (``close_position`` 403s on naked legs).
   - the server-side trailing-stop arm: a broker-managed reducing stop.
-A future refactor SHOULD centralise these too; until then they are safe but the
-"one choke-point" guarantee holds only for the routed paths above.
+A future refactor SHOULD centralise the remaining crypto/option closes too;
+until then they are safe and the "one choke-point" guarantee holds for every
+path where a stock short/flip/oversize is possible.
 
 Invariants (locked by tests/test_order_gateway.py):
 

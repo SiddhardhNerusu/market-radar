@@ -4220,8 +4220,13 @@ class LiveTrader:
                         client_order_id=f"tpfirec-{close_sym.replace('/','')}-{_time.time_ns()}",
                     )
                 else:
-                    # Stocks: standard close_position works fine
-                    self.alpaca.close_position(close_sym)
+                    # Stocks: route the close through the gateway (reduce-only by
+                    # live sign, fail-closed, single choke-point) instead of a raw
+                    # close_position — full-audit ch3. None == refused / already flat.
+                    if self.gateway.submit(intent=GW_CLOSE, symbol=close_sym,
+                                           positions=positions) is None:
+                        log.error("  ✗ gateway refused close(%s) — retry next loop", sym)
+                        continue
                 succeeded += 1
                 log.info("  ✓ submitted close for %s qty=%g u_pnl=$%.2f", sym, p.qty, p.unrealized_pl)
             except AlpacaError as exc:

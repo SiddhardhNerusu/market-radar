@@ -60,11 +60,13 @@ CRYPTO_PAIRS: tuple[str, ...] = (
     "BAT/USD",
 )
 
-LIQUID_UNIVERSE: tuple[str, ...] = US_LARGE_CAPS + US_ETFS + CRYPTO_PAIRS
-
-# Subset that's safe for stock-bracket orders (excludes crypto, which
-# Alpaca trades 24/7 but doesn't support brackets on).
+# EQUITY-ONLY since the full-audit rebuild: the crypto lane is decommissioned
+# (Alpaca spot can't be shorted; the lane was unbookable + half-untradeable), so the
+# scanner no longer scans crypto at source — this stops ~500 crypto names/day being
+# scored only to be blocked at the execution gate. CRYPTO_PAIRS is kept for reference
+# but is no longer part of the scanned universe.
 LIQUID_EQUITIES: tuple[str, ...] = US_LARGE_CAPS + US_ETFS
+LIQUID_UNIVERSE: tuple[str, ...] = LIQUID_EQUITIES
 
 # Sector mapping for the macro regime / risk manager.
 SECTOR_OF: dict[str, str] = {

@@ -68,7 +68,8 @@ DEFAULTS = {
     "stocktwits_seconds":  2 * 60,
     "earnings_calendar_seconds": 12 * 60 * 60,  # twice a day — Finnhub free tier
     "t212_snap_seconds":   5 * 60,
-    "scoring_seconds":     30,
+    "scoring_seconds":     60,          # was 30 — a backlog batch ran >30s and overran the tick
+                                        # (~8.9k 'max instances reached' warns/audit); 60s fits the window
     "outcome_snap_seconds": 60,
     "outcome_update_seconds": 60 * 60,
     "notify_seconds":      30,

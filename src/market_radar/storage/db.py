@@ -278,6 +278,12 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_inst_holdings_ticker ON institutional_holdings(ticker, quarter_end DESC)",
         "CREATE INDEX IF NOT EXISTS idx_dhh_source ON daemon_health_history(source, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_raw_signals_dup_cluster ON raw_signals(dup_cluster_id)",
+        # Anti-join for score_pending's 'find unscored rows' (full-audit ch8). Without
+        # it the LEFT JOIN searched signal_scores by TICKER only, full-scanning masses
+        # of score rows for high-volume tickers (SPY/QQQ) every 60s scoring tick — the
+        # root cause of the apscheduler overrun. (signal_id,ticker) makes it a covering
+        # index seek: the find-unscored query drops from minutes to ~0.2s.
+        "CREATE INDEX IF NOT EXISTS idx_signal_scores_sig_ticker ON signal_scores(signal_id, ticker)",
     ]
     for idx in new_indices:
         try:

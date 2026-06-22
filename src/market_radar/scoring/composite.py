@@ -257,7 +257,15 @@ def _score_one(
     megacap_bonus = 0.5 if ticker.upper() in MEGACAPS else 0.0
 
     # Penalties
-    anti_pump_flag = 1 if raw_payload.get("anti_pump_flag") else 0
+    # Anti-pump: a REAL heuristic now (audit: the old flag read a raw_payload key
+    # that ingestion never set, so this penalty was dead code). Pump-and-dumps are
+    # speculative, non-factual blasts from low-credibility (social/unknown) sources;
+    # penalise those so they can't ride source/corroboration into the "strong" bucket.
+    anti_pump_flag = 1 if (
+        classification.event_type == "speculation"
+        and classification.factual == 0
+        and source_weight < 4.0
+    ) else 0
     pump_penalty = 2.0 if anti_pump_flag else 0.0
     routine_penalty = 2.0 if is_routine else 0.0
 

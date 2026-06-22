@@ -11,21 +11,28 @@ from __future__ import annotations
 from typing import Literal, Optional
 
 
-# 0–3 scale: how much price action does this event usually drive?
-# Calibrated qualitatively now; the ML model will refine empirically.
+# 0–3 scale: how much ATTENTION / VOLATILITY an event draws — explicitly NOT a
+# profit signal. RECALIBRATED 2026-06-21 (full audit): the old weights conflated
+# volatility with edge and pushed sell-the-news events to the TOP of the feed, where
+# realized day-demeaned returns are NEGATIVE (m_a -2.3% net, ipo -7.4%, clinical
+# -1.0%). Those are down-weighted so the composite stops surfacing priced-in /
+# direction-unknown events as "best buys". High composite now means "high-attention
+# catalyst — verify", NOT "buy": no fitted predictive edge exists in these features
+# (see the composite-score audit). The ML model never refined these empirically.
 EVENT_IMPACT: dict[str, float] = {
-    # Highest impact — frequently 5–20% moves
-    "m_a_announcement":   3.0,
-    "m_a_rumor":          2.4,
-    "fda_approval":       3.0,
-    "fda_rejection":      3.0,
+    # High ATTENTION but audit-confirmed NEGATIVE / direction-unknown realized —
+    # so no longer top-ranked (volatility != edge).
+    "m_a_announcement":   1.0,      # was 3.0 — target already gapped; audit -2.3% net
+    "m_a_rumor":          1.2,      # rumor keeps more residual move than a confirmed deal
+    "fda_approval":       1.8,      # binary + directional, but usually pre-run
+    "fda_rejection":      2.0,      # sharp, less-anticipated downside
     "earnings_beat":      2.7,
     "earnings_miss":      2.7,
     "guidance_raise":     2.5,
     "guidance_cut":       2.5,
     "macro":              2.8,
     "activist_position":  2.4,
-    "clinical_trial_result": 3.0,   # binary biotech catalyst — large moves
+    "clinical_trial_result": 1.0,   # was 3.0 — binary, direction unknown from type; audit -1.0%
     "short_seller_report": 2.4,     # activist short report — sharp downside
 
     # Medium impact — usually 1–5% moves
@@ -41,8 +48,8 @@ EVENT_IMPACT: dict[str, float] = {
     "contract_award":     1.9,      # major contract / deal win
 
     # Lower impact — usually <1% moves
-    "ipo_registration":   1.2,
-    "ipo_registration_amend": 0.9,
+    "ipo_registration":   0.3,      # was 1.2 — structurally NEGATIVE realized; audit -7.4%
+    "ipo_registration_amend": 0.3,  # was 0.9
     "material_event":     1.5,   # generic 8-K; LLM would refine
     "material_event_amend": 1.0,
     "speculation":        0.7,

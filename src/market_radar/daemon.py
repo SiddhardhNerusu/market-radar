@@ -80,6 +80,7 @@ DEFAULTS = {
     "finra_short_interest_seconds": 12 * 60 * 60,  # FINRA bi-monthly short interest (#5)
     "clinicaltrials_seconds": 8 * 60 * 60,         # ClinicalTrials.gov v2 readouts (#5)
     "near_dup_seconds": 6 * 60 * 60,               # SimHash near-dup re-cluster (#6)
+    "reconcile_pnl_seconds": 30 * 60,              # rebuild bot_daily_pnl realized from Alpaca fills (source of truth)
 }
 
 
@@ -355,6 +356,21 @@ def configure_logging() -> None:
     )
 
 
+def _job_reconcile_pnl() -> None:
+    """Rebuild bot_daily_pnl realized P&L from Alpaca equity fills — the SOURCE OF
+    TRUTH (full-audit ch6). The per-trade ledger had drifted to ~13% of real P&L
+    because exits were mis-booked; this idempotent fills FIFO replaces realized /
+    trades / wins / losses for the equity-lane era. The equity CURVE remains the
+    authoritative headline (daily_assessment); this keeps the per-trade view honest."""
+    from .execution.alpaca_client import AlpacaClient
+    from .execution.pnl_reconcile import reconcile_daily_pnl_from_fills
+    from .storage import get_connection
+    since = os.getenv("PNL_RECONCILE_SINCE", "2026-06-15")
+    summ = reconcile_daily_pnl_from_fills(AlpacaClient(), get_connection, since_date=since)
+    log.info("[reconcile_pnl] rebuilt %d day(s) since %s | equity-lane realized=%s | uncovered=%d",
+             summ["dates_written"], since, summ["total_realized"], summ["uncovered"])
+
+
 def build_scheduler() -> BackgroundScheduler:
     sched = BackgroundScheduler(
         timezone="UTC",
@@ -391,6 +407,7 @@ def build_scheduler() -> BackgroundScheduler:
         ("finra_short_int", _job_finra_short_interest, DEFAULTS["finra_short_interest_seconds"]),
         ("clinicaltrials", _job_clinicaltrials, DEFAULTS["clinicaltrials_seconds"]),
         ("near_dup",       _job_near_dup,       DEFAULTS["near_dup_seconds"]),
+        ("reconcile_pnl",  _job_reconcile_pnl,  DEFAULTS["reconcile_pnl_seconds"]),
     ]
     for i, (name, fn, interval) in enumerate(jobs):
         sched.add_job(

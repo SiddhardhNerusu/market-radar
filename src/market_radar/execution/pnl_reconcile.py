@@ -17,7 +17,12 @@ pages the Alpaca activities API oldest-first and keeps only equity fills.
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from typing import Iterable
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _is_equity_symbol(sym: str) -> bool:
@@ -116,3 +121,38 @@ def pull_equity_fills(alpaca, *, max_pages: int = 50) -> list[dict]:
         if len(page) < 100:
             break
     return out
+
+
+def reconcile_daily_pnl_from_fills(alpaca, conn_factory, *, since_date=None,
+                                   now_iso=None) -> dict:
+    """Rebuild bot_daily_pnl realized columns from Alpaca equity fills — idempotent
+    and the source of truth. Only writes dates >= ``since_date`` (so the pre-rebuild
+    mixed-asset history, which only the equity curve can honestly value, is left
+    untouched). Returns a summary. Pass ``now_iso`` in tests for determinism.
+    """
+    fills = pull_equity_fills(alpaca)
+    by_date, uncovered = realized_from_fills(fills)
+    stamp = now_iso or _utc_now_iso()
+    written = 0
+    with conn_factory() as conn:
+        for day, rec in sorted(by_date.items()):
+            if since_date and day < since_date:
+                continue
+            conn.execute(
+                """INSERT INTO bot_daily_pnl
+                       (trading_date, realized_pnl_usd, trades_count, wins, losses, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(trading_date) DO UPDATE SET
+                       realized_pnl_usd = excluded.realized_pnl_usd,
+                       trades_count     = excluded.trades_count,
+                       wins             = excluded.wins,
+                       losses           = excluded.losses,
+                       updated_at       = excluded.updated_at""",
+                (day, rec["realized"], rec["trades"], rec["wins"], rec["losses"], stamp),
+            )
+            written += 1
+    return {
+        "dates_written": written,
+        "uncovered": len(uncovered),
+        "total_realized": round(sum(r["realized"] for r in by_date.values()), 2),
+    }

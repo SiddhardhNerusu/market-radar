@@ -76,3 +76,78 @@ def test_equity_symbol_filter():
     assert not _is_equity_symbol("BTC/USD")           # crypto pair
     assert not _is_equity_symbol("NVDA260605C00225000")  # OCC option
     assert not _is_equity_symbol("")
+
+
+# --- reconcile-to-DB (the idempotent ledger rebuild) ---
+from contextlib import contextmanager  # noqa: E402
+
+from market_radar.execution.pnl_reconcile import reconcile_daily_pnl_from_fills  # noqa: E402
+from market_radar.storage.db import get_connection as _gc, init_db  # noqa: E402
+
+
+class _FakeAlpaca:
+    """One page of fills, then empty (mimics Alpaca activities paging)."""
+    def __init__(self, fills):
+        self._fills = fills
+
+    def _request(self, method, path, params=None):
+        return self._fills if (params or {}).get("page_token") is None else []
+
+
+def _factory(db):
+    @contextmanager
+    def cf(path=None):
+        with _gc(db) as c:
+            yield c
+    return cf
+
+
+def test_reconcile_writes_daily_pnl_excluding_crypto(tmp_path):
+    db = tmp_path / "t.db"; init_db(db)
+    fills = [
+        _f("AAPL", "buy", 100, 10.0, "2026-06-20T14:00:00Z") | {"id": "1"},
+        _f("AAPL", "sell", 100, 11.0, "2026-06-20T15:00:00Z") | {"id": "2"},
+        _f("BTC/USD", "buy", 1, 100.0, "2026-06-20T16:00:00Z") | {"id": "3"},  # crypto: ignored
+    ]
+    summ = reconcile_daily_pnl_from_fills(
+        _FakeAlpaca(fills), _factory(db), now_iso="2026-06-21T00:00:00Z")
+    assert summ["total_realized"] == 100.0  # crypto excluded
+    with _gc(db) as c:
+        row = c.execute(
+            "SELECT realized_pnl_usd, trades_count, wins, losses "
+            "FROM bot_daily_pnl WHERE trading_date='2026-06-20'").fetchone()
+    assert round(row[0], 2) == 100.0 and row[1] == 1 and row[2] == 1 and row[3] == 0
+
+
+def test_reconcile_since_date_leaves_old_history_untouched(tmp_path):
+    db = tmp_path / "t.db"; init_db(db)
+    fills = [
+        _f("AAPL", "buy", 10, 10.0, "2026-05-01T14:00:00Z") | {"id": "1"},
+        _f("AAPL", "sell", 10, 12.0, "2026-05-01T15:00:00Z") | {"id": "2"},  # old: skipped
+        _f("MSFT", "buy", 10, 10.0, "2026-06-20T14:00:00Z") | {"id": "3"},
+        _f("MSFT", "sell", 10, 9.0, "2026-06-20T15:00:00Z") | {"id": "4"},   # -10: kept
+    ]
+    summ = reconcile_daily_pnl_from_fills(
+        _FakeAlpaca(fills), _factory(db), since_date="2026-06-01",
+        now_iso="2026-06-21T00:00:00Z")
+    assert summ["dates_written"] == 1
+    with _gc(db) as c:
+        assert c.execute("SELECT COUNT(*) FROM bot_daily_pnl "
+                         "WHERE trading_date='2026-05-01'").fetchone()[0] == 0
+        assert round(c.execute("SELECT realized_pnl_usd FROM bot_daily_pnl "
+                               "WHERE trading_date='2026-06-20'").fetchone()[0], 2) == -10.0
+
+
+def test_reconcile_is_idempotent(tmp_path):
+    db = tmp_path / "t.db"; init_db(db)
+    fills = [
+        _f("AAPL", "buy", 100, 10.0, "2026-06-20T14:00:00Z") | {"id": "1"},
+        _f("AAPL", "sell", 100, 11.0, "2026-06-20T15:00:00Z") | {"id": "2"},
+    ]
+    fac = _factory(db)
+    reconcile_daily_pnl_from_fills(_FakeAlpaca(fills), fac, now_iso="2026-06-21T00:00:00Z")
+    reconcile_daily_pnl_from_fills(_FakeAlpaca(fills), fac, now_iso="2026-06-21T00:00:00Z")
+    with _gc(db) as c:  # running twice must NOT double-count
+        rows = c.execute("SELECT realized_pnl_usd FROM bot_daily_pnl "
+                         "WHERE trading_date='2026-06-20'").fetchall()
+    assert len(rows) == 1 and round(rows[0][0], 2) == 100.0

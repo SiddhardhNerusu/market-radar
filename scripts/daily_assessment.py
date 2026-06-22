@@ -35,8 +35,13 @@ def build_report() -> str:
     wk = (now - timedelta(days=7)).strftime("%Y-%m-%d")
     L = []
     with get_connection() as conn:
-        # --- TRUE P&L (honest ledger) ---
+        # --- TRUE P&L: the EQUITY CURVE is authoritative (full-audit finding). The
+        # per-trade ledger captured only ~13% of real P&L across the old 3-asset mix,
+        # so all-time P&L = current equity - starting equity is the only honest number.
         today_eq = _q1(conn, "SELECT equity_usd FROM bot_account_snapshots ORDER BY id DESC LIMIT 1")
+        start_eq = _q1(conn, "SELECT equity_usd FROM bot_account_snapshots ORDER BY id ASC LIMIT 1") or 0.0
+        # Per-trade ledger (now fills-reconciled on the equity-only lane; still PARTIAL
+        # over the historical mixed-asset period — labelled as such below).
         wk_realized = _q1(conn, "SELECT ROUND(SUM(realized_pnl_usd),2) FROM bot_daily_pnl WHERE trading_date>=?", (wk,)) or 0.0
         today_realized = _q1(conn, "SELECT ROUND(realized_pnl_usd,2) FROM bot_daily_pnl ORDER BY trading_date DESC LIMIT 1") or 0.0
         # --- EDGE PROGRESS (distinct clean days) ---
@@ -90,8 +95,11 @@ def build_report() -> str:
     L.append(f"📋 <b>DAILY ASSESSMENT — {now:%Y-%m-%d} (PAPER)</b>")
     L.append(verdict)
     L.append("")
-    L.append(f"<b>True P&L:</b> today realized ${today_realized:+.2f} | 7d ${wk_realized:+.2f} | "
-             f"equity ${float(today_eq or 0):,.0f}")
+    _eq = float(today_eq or 0); _start = float(start_eq or 0)
+    L.append(f"<b>P&L TRUTH (equity curve — authoritative):</b> equity ${_eq:,.0f} | "
+             f"all-time ${_eq - _start:+,.0f} (from ${_start:,.0f} start)")
+    L.append(f"<b>Per-trade ledger (partial — equity-lane fills only):</b> "
+             f"today ${today_realized:+.2f} | 7d ${wk_realized:+.2f}")
     L.append(f"<b>Edge progress:</b> {clean_days}/{RANK_MIN_DAYS} distinct clean days")
     L.append(f"<b>Pipeline:</b> scored {scored_today} | classified {classified_today} "
              f"| backlog {backlog}" + (" ⚠STALLED" if (scored_today > 50 and classified_today == 0) else ""))

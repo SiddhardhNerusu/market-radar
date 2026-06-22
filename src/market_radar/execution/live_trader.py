@@ -720,7 +720,14 @@ class LiveTrader:
                 log.error("[orphan-adopt] ROGUE position %s notional $%.0f > account $%.0f — "
                           "FLATTENING, not adopting", sym, _notional, _cap)
                 try:
-                    self.alpaca.close_position(p.symbol)
+                    # Route through the gateway (reduce-only by live sign,
+                    # fail-closed, single choke-point) — this rogue path is the
+                    # exact TRDA flip-and-grow vector the gateway exists to
+                    # neutralise. None == refused / already flat (retry/manual).
+                    if self.gateway.submit(intent=GW_CLOSE, symbol=p.symbol,
+                                           positions=positions) is None:
+                        log.error("[orphan-adopt] rogue flatten %s refused by gateway "
+                                  "(needs retry/manual)", sym)
                 except AlpacaError as exc:
                     log.error("[orphan-adopt] rogue flatten %s failed (needs retry/manual): %s",
                               sym, exc)
@@ -4427,7 +4434,14 @@ class LiveTrader:
             if "/" in sym or len(sym) > 9:
                 continue
             try:
-                self.alpaca.close_position(sym)
+                # Route the stock close through the gateway (reduce-only by
+                # live sign, fail-closed, single choke-point) instead of a raw
+                # close_position — full-audit, matching _fire_daily_flatten.
+                # None == refused / already flat: book nothing, retry next loop.
+                if self.gateway.submit(intent=GW_CLOSE, symbol=sym,
+                                       positions=positions) is None:
+                    log.error("  ✗ gateway refused EOD close(%s) — retry next loop", sym)
+                    continue
                 pnl = float(p.unrealized_pl)
                 total_pnl += pnl
                 closed_count += 1

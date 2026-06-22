@@ -77,7 +77,7 @@ class Config:
     risk_max_position_pct: float = 5.0
     risk_max_sector_pct: float = 25.0
     risk_max_daily_trades: int = 10
-    risk_max_concurrent_positions: int = 12  # 0 = unlimited (pool/per-name/sector + Kelly govern the split); >0 = hard headcount ceiling
+    risk_max_concurrent_positions: int = 6   # finite concentration backstop (audit: unlimited is the worst control); 0 = disabled
     risk_drift_block_hours: int = 24
     risk_min_calibrated_p: float = 0.62
     risk_emergency_stop: bool = False
@@ -180,7 +180,7 @@ def load_config() -> Config:
         risk_max_position_pct=_float(os.getenv("RISK_MAX_POSITION_PCT"), 5.0),
         risk_max_sector_pct=_float(os.getenv("RISK_MAX_SECTOR_PCT"), 25.0),
         risk_max_daily_trades=_int(os.getenv("RISK_MAX_DAILY_TRADES"), 10),
-        risk_max_concurrent_positions=_int(os.getenv("RISK_MAX_CONCURRENT_POSITIONS"), 12),
+        risk_max_concurrent_positions=_int(os.getenv("RISK_MAX_CONCURRENT_POSITIONS"), 6),
         risk_drift_block_hours=_int(os.getenv("RISK_DRIFT_BLOCK_HOURS"), 24),
         risk_min_calibrated_p=_float(os.getenv("RISK_MIN_CALIBRATED_P"), 0.62),
         risk_emergency_stop=_bool(os.getenv("RISK_EMERGENCY_STOP"), False),

@@ -1573,6 +1573,14 @@ class LiveTrader:
     def _process_candidate(self, cand: dict, *, account, market_open: bool,
                             positions=None) -> None:
         symbol = cand["symbol"]
+        # SCOPE (2026-06-21 full-audit rebuild): narrowed to a SINGLE equity lane.
+        # Crypto is decommissioned — Alpaca spot can't be shorted, so the direction-
+        # agnostic price-action scanner spammed ~2,467 'crypto_short_not_supported'
+        # blocks/loop and crypto exits were never booked (untrustworthy P&L). Options
+        # stay disabled via cfg.options_enabled (a confirmed net loser, -$1,114). One
+        # coherent, accountable strategy beats three half-broken ones sharing a budget.
+        if "/" in symbol:
+            return
         score_id = cand["score_id"]
         p = float(cand["model_p"]) if cand.get("model_p") is not None else 0.50
         composite = float(cand["composite_score"])

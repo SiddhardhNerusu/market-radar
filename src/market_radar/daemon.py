@@ -27,6 +27,7 @@ All polls run defensively — one failed source never crashes the daemon.
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import time
@@ -232,7 +233,11 @@ def _job_price_action() -> None:
     try:
         from .signals import PriceActionScanner
         if _PA_SCANNER is None:
-            _PA_SCANNER = PriceActionScanner()
+            # Equity-only: crypto lane decommissioned (full-audit). The scanner's
+            # crypto_universe defaults to CRYPTO_PAIRS and is scanned even when the
+            # stock market is closed — pass () so no crypto is scanned at SOURCE
+            # (redefining LIQUID_UNIVERSE alone was inert; the scanner reads this param).
+            _PA_SCANNER = PriceActionScanner(crypto_universe=())
         _PA_SCANNER.run()
     except Exception as exc:  # noqa: BLE001
         log.exception("price_action job error: %s", exc)

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.marketradar.reconcile</string>
+  <key>ProgramArguments</key><array>
+    <string>__HOME__/Documents/Claude/Projects/MARKET RADAR/.venv/bin/python</string>
+    <string>__HOME__/Documents/Claude/Projects/MARKET RADAR/scripts/reconcile_pnl.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>__HOME__/Documents/Claude/Projects/MARKET RADAR</string>
+  <!-- 01:30 local (BST). Fires after the US extended-hours close (8pm ET = 01:00
+       BST) so the day's equity fills are all in, and before the 03:00 DB backup
+       so the backup captures the reconciled ledger. Idempotent full rebuild, so
+       a late after-hours fill is just picked up by the next night's run. -->
+  <key>StartCalendarInterval</key><dict>
+    <key>Hour</key><integer>1</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>StandardOutPath</key><string>__HOME__/Documents/Claude/Projects/MARKET RADAR/logs/launchd-reconcile.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Documents/Claude/Projects/MARKET RADAR/logs/launchd-reconcile.err</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>

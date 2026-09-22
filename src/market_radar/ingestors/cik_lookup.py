@@ -8,6 +8,8 @@ The file is small (~1 MB) and the SEC asks you set a descriptive User-Agent.
 """
 from __future__ import annotations
 
+import os
+
 import json
 import logging
 import time
@@ -25,7 +27,7 @@ CACHE_TTL_SECONDS = 7 * 24 * 3600  # 1 week
 
 # SEC requires a User-Agent that identifies the requester. Format per their
 # guidance: "Name email@example.com". This is sent on all SEC requests.
-DEFAULT_UA = "MARKET RADAR (research; redacted@example.com)"
+DEFAULT_UA = os.getenv("SEC_USER_AGENT", "market-radar research (set SEC_USER_AGENT to \"name email\" per SEC fair-access rules)")
 
 
 class CikLookup:

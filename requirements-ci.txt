@@ -1,0 +1,20 @@
+# Minimal dependency set for running the unit-test suite in CI.
+# The full runtime set (torch, transformers, shap, ...) lives in requirements.txt.
+pytest
+numpy
+pandas
+scikit-learn
+scipy
+lightgbm
+APScheduler
+python-dotenv
+requests
+feedparser
+beautifulsoup4
+lxml
+anthropic
+pydantic
+yfinance
+flask
+praw
+joblib

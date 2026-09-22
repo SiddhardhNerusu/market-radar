@@ -29,6 +29,8 @@ Feature impact:
 """
 from __future__ import annotations
 
+import os
+
 import argparse
 import logging
 import statistics
@@ -50,7 +52,7 @@ log = logging.getLogger("refresh_attention_data")
 
 
 WIKI_API = "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/en.wikipedia.org/all-access/user/{title}/daily/{start}/{end}"
-USER_AGENT = "MARKET RADAR research (redacted@example.com)"
+USER_AGENT = os.getenv("RESEARCH_CONTACT_UA", "market-radar research (set RESEARCH_CONTACT_UA)")
 
 
 def _utc_now() -> str:

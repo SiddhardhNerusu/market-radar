@@ -13,6 +13,8 @@ self-tag and the labels are often inaccurate).
 """
 from __future__ import annotations
 
+import os
+
 import logging
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
@@ -32,7 +34,7 @@ class StockTwitsTrendingIngestor(Ingestor):
     source = "stocktwits_trending"
     source_tier = 3
 
-    USER_AGENT = "market-radar/0.1 (research; contact: redacted@example.com)"
+    USER_AGENT = os.getenv("RESEARCH_CONTACT_UA", "market-radar/0.1 (research; set RESEARCH_CONTACT_UA)")
 
     def __init__(self, *, timeout: float = STREAM_TIMEOUT) -> None:
         super().__init__()

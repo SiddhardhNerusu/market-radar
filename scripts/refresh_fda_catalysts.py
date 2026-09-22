@@ -19,6 +19,8 @@ return zero new catalysts rather than fail loudly.
 """
 from __future__ import annotations
 
+import os
+
 import argparse
 import logging
 import re
@@ -40,7 +42,7 @@ log = logging.getLogger("refresh_fda_catalysts")
 
 
 MARKETBEAT_URL = "https://www.marketbeat.com/fda-calendar/upcoming/"
-USER_AGENT = "MARKET RADAR research (redacted@example.com)"
+USER_AGENT = os.getenv("RESEARCH_CONTACT_UA", "market-radar research (set RESEARCH_CONTACT_UA)")
 
 
 def _utc_now() -> str:

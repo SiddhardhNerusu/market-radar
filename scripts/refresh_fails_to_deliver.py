@@ -8,6 +8,8 @@ Run weekly via cron.
 """
 from __future__ import annotations
 
+import os
+
 import argparse, csv, io, logging, sys, zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +31,7 @@ SEC_FTD_LIST_CANDIDATES = [
     "https://www.sec.gov/data/foiadocsfailsdatahtm",
 ]
 
-UA = "MARKET RADAR research (redacted@example.com)"
+UA = os.getenv("RESEARCH_CONTACT_UA", "market-radar research (set RESEARCH_CONTACT_UA)")
 
 
 def _utc_now() -> str:
@@ -130,7 +132,7 @@ def main() -> int:
     log.info("Fetching: %s", url)
     try:
         r = requests.get(url, timeout=120,
-                         headers={"User-Agent": "MARKET RADAR research (redacted@example.com)"})
+                         headers={"User-Agent": os.getenv("RESEARCH_CONTACT_UA", "market-radar research (set RESEARCH_CONTACT_UA)")})
         r.raise_for_status()
     except requests.RequestException as exc:
         log.warning("FTD download failed: %s", exc)

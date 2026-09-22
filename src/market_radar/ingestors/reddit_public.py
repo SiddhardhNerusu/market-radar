@@ -17,6 +17,8 @@ Anti-pump heuristics applied at ingest time:
 """
 from __future__ import annotations
 
+import os
+
 import logging
 import time
 from dataclasses import dataclass
@@ -70,7 +72,7 @@ SUBREDDITS: list[SubredditSpec] = [
 REDDIT_JSON_URL = "https://www.reddit.com/r/{sub}/new.json?limit=40"
 # Reddit asks for a descriptive User-Agent in the format <platform>:<id>:<ver> by <reddit-handle>
 # Without this, we get 429/403 much faster.
-REDDIT_USER_AGENT = "macos:market-radar:0.1 (research, contact: redacted@example.com)"
+REDDIT_USER_AGENT = os.getenv("REDDIT_USER_AGENT", "macos:market-radar:0.1 (research; set REDDIT_USER_AGENT)")
 
 
 class RedditPublicIngestor(Ingestor):

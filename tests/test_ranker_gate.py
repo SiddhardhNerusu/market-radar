@@ -107,18 +107,23 @@ def test_train_if_gated_blocks_and_does_not_deploy(tmp_path, monkeypatch):
     assert list(tmp_path.glob("*.joblib")) == []
 
 
-def test_real_db_is_below_floor():
-    """Sanity: today's real DB is below the floor, so the gate blocks now.
-    (Confirms ACCEPTANCE: data-gate blocks today, serves composite.)"""
+def test_real_db_gate_is_consistent_with_its_day_count():
+    """Sanity against whatever DB is present: the deploy gate's verdict must
+    follow from the distinct-clean-day count it was given. Below the floor it
+    must serve composite; at or above it must not fall back for lack of data.
+    (This used to assert the DB was *below* the floor, which stopped being
+    true once the DB accumulated 40+ clean days.)"""
     try:
         days = ranker.distinct_clean_days()
     except Exception:  # noqa: BLE001 — no DB in some CI sandboxes
         pytest.skip("DB unavailable")
     d = ranker.evaluate_deploy_gate(distinct_days=days)
-    assert days < ranker.RANK_MIN_DAYS, (
-        f"expected < {ranker.RANK_MIN_DAYS} clean days today, got {days}")
-    assert d.decision == ranker.DECISION_COMPOSITE_FALLBACK
-    assert d.served_model == "composite"
+    assert d.distinct_days == days
+    if days < ranker.RANK_MIN_DAYS:
+        assert d.decision == ranker.DECISION_COMPOSITE_FALLBACK
+        assert d.served_model == "composite"
+    else:
+        assert d.decision != ranker.DECISION_COMPOSITE_FALLBACK
 
 
 # ---------------------------------------------------------------------------

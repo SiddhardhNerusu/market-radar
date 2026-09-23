@@ -237,7 +237,7 @@ Hard rules:
 - Backup data/market_radar.db before run.
 - Print full LLM input + output for the first 5 calls of each new event bucket so we catch empty-body or hallucination bugs at $0.05 not $5.
 
-Steps: standard run_llm_backfill.py flow per RUNBOOK_LLM_REDO.md, with the new structured-extraction prompt from 4A.
+Steps: standard run_llm_backfill.py flow (see run_llm_backfill.py --help), with the new structured-extraction prompt from 4A.
 
 Success: 6,000+ new classifications, structured fields populated, $25 cap not breached, daemon llm_classify resumed.
 Failure: if verify_llm_sample.py reports >50% "other" or any structured field missing >70% of the time, STOP and tell me. Do not push through.

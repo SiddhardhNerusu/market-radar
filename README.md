@@ -12,8 +12,7 @@ account only) sizes and executes trades under a rule-based risk manager.
 **The headline result is a negative one, and I think it is the most valuable thing in the repo.**
 After building the full pipeline I ran every signal family through a seven-test statistical gauntlet
 (dedup, market-beta removal, transaction costs, out-of-sample split, outlier removal, permutation tests,
-Bonferroni correction). The paper-trading bot lost money over 26 trading days. Both
-facts are documented below. 
+Bonferroni correction). The paper-trading bot lost money over 26 trading days. a system that handles money has to be able to tell you when it has no edge. 
 
 > **This has never traded real money.** Every order in this repository was placed against an Alpaca
 > paper account.

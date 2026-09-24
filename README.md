@@ -4,7 +4,7 @@
 ![python](https://img.shields.io/badge/python-3.11-blue)
 ![paper trading only](https://img.shields.io/badge/trading-paper%20only-orange)
 
-An end-to-end quantitative research and automated paper-trading system, built solo over about six weeks in 2026.
+An end-to-end quantitative research and automated paper-trading system, built independantly over about six weeks in 2026.
 It ingests market-moving events from 80+ sources, classifies them with an LLM, scores them with a
 calibrated ML ensemble, measures the real forward returns of every signal, and (on a broker **paper**
 account only) sizes and executes trades under a rule-based risk manager.
@@ -12,12 +12,11 @@ account only) sizes and executes trades under a rule-based risk manager.
 **The headline result is a negative one, and I think it is the most valuable thing in the repo.**
 After building the full pipeline I ran every signal family through a seven-test statistical gauntlet
 (dedup, market-beta removal, transaction costs, out-of-sample split, outlier removal, permutation tests,
-Bonferroni correction). Nothing survived. The paper-trading bot lost money over 26 trading days. Both
-facts are documented below rather than hidden, because a system that handles money has to be able to
-tell you when it has no edge.
+Bonferroni correction). The paper-trading bot lost money over 26 trading days. Both
+facts are documented below. 
 
 > **This has never traded real money.** Every order in this repository was placed against an Alpaca
-> paper account. Nothing here is investment advice.
+> paper account.
 
 ---
 
@@ -115,7 +114,7 @@ tell you when it has no edge.
 | Account equity | $100,000 → $91,958 (−8.0 %) |
 | Sizing | capped to a $6.3 k–$10 k notional book to mimic a ~£5 k real account |
 
-The bot lost money. About $2 k of the loss landed on 29 May, about $5.3 k on 10–11 June in the flip-short incident described above, and the remaining weeks were roughly flat. That is consistent with the research finding below, which is that the signals it was trading had no measurable edge.
+The bot lost money. About $2 k of the loss landed on 29 May, about $5.3 k on 10–11 June in the flip-short incident described above, and the remaining weeks were roughly flat. That is consistent with the research finding below, which is that the signals it was trading had no measurable edge. 
 
 ### The edge gauntlet
 
@@ -179,6 +178,4 @@ The daemon, trader and dashboard all read `data/market_radar.db`; the database, 
 
 Python 3.11 · SQLite (WAL) · scikit-learn · LightGBM · APScheduler · Flask · Anthropic SDK · Alpaca REST · yfinance · feedparser · pytest · GitHub Actions
 
-## Disclaimer
 
-Research and engineering project. Paper trading only. No part of this is financial advice, and the author's conclusion from the data is that the strategies in this repository should not be traded with real money.

@@ -77,6 +77,7 @@ class Event:
     n_filings: int = 1
     avg_price: float = 0.0      # notional-weighted purchase price (for cost tiering)
     time_known: bool = True     # False when published_at carried no clock time
+    n_insiders: int = 1         # distinct reporting owners buying in the group (cluster size)
 
 
 @dataclass(frozen=True)
@@ -254,6 +255,7 @@ def select_insider_events(
     min_price: float = 10.0,
     exclude_10b5_1: bool = True,
     senior_only: bool = False,
+    min_insiders: int = 1,
     trading_days: Optional[set[date]] = None,
 ) -> list[Event]:
     """Turn insider_transactions rows into strictly deduplicated events.
@@ -308,8 +310,9 @@ def select_insider_events(
         day = actionable_day(ts, trading_days)
         g = groups.setdefault((ticker, day), {
             "ts": ts, "notional": 0.0, "shares": 0.0, "role": 0, "n": 0,
-            "time_known": True,
+            "time_known": True, "insiders": set(),
         })
+        g["insiders"].add((r.get("insider_name") or f"sig{r.get('signal_id')}").strip().upper())
         g["ts"] = max(g["ts"], ts)
         g["notional"] += shares * price
         g["shares"] += shares
@@ -321,6 +324,8 @@ def select_insider_events(
     for (ticker, day), g in groups.items():
         if g["notional"] < min_notional_usd:
             continue
+        if len(g["insiders"]) < min_insiders:
+            continue
         events.append(Event(
             ticker=ticker,
             event_ts=g["ts"],
@@ -330,6 +335,7 @@ def select_insider_events(
             n_filings=g["n"],
             avg_price=g["notional"] / g["shares"] if g["shares"] else 0.0,
             time_known=g["time_known"],
+            n_insiders=len(g["insiders"]),
         ))
     events.sort(key=lambda e: (e.event_day, e.ticker))
     return events

@@ -26,6 +26,8 @@ daily (no Alpaca keys at the time).
 | senior (director / C-suite) | 4,930 | 538 | −0.29% | −0.59% | 43.3% | −1.49% | [−0.50, −0.06] | −1.16% |
 | ≥ $100k | 4,424 | 548 | −0.19% | −0.59% | 43.6% | −1.56% | [−0.44, 0.05] | −1.20% |
 | 2026 Q1 only | 897 | 61 | +0.08% | −0.31% | 45.9% | −1.42% | [−0.59, 0.76] | +0.16% |
+| cluster: ≥ 2 distinct insiders same day | 984 | 427 | −0.32% | −0.51% | 44.5% | −1.56% | [−0.71, 0.09] | −0.98% |
+| cluster: ≥ 3 distinct insiders same day | 389 | 267 | −0.35% | −0.62% | 43.7% | −1.68% | [−1.05, 0.36] | −1.42% |
 
 Every cut FAILS the promotion gate at both horizons: the net median is negative,
 the trimmed mean is negative, the mean after dropping the top 10% of winners is

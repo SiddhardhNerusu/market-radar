@@ -193,7 +193,7 @@ def load_rows(since: date) -> Optional[list[dict]]:
                   "cannot be excluded (treated as unknown).")
         rows = conn.execute(
             f"""SELECT ix.ticker, ix.transaction_code, ix.is_acquired, ix.shares,
-                       ix.price, ix.role_score, {plan_col} AS is_10b5_1,
+                       ix.price, ix.role_score, ix.insider_name, {plan_col} AS is_10b5_1,
                        rs.published_at, rs.id AS signal_id
                 FROM insider_transactions ix
                 JOIN raw_signals rs ON rs.id = ix.signal_id
@@ -244,6 +244,8 @@ def main() -> int:
                     "ticker's events used for its placebo pool")
     ap.add_argument("--no-minute", action="store_true", help="skip minute bars; enter at close")
     ap.add_argument("--senior-only", action="store_true")
+    ap.add_argument("--min-insiders", type=int, default=1,
+                    help="cluster cut: require this many DISTINCT insiders buying the same name the same day")
     ap.add_argument("--include-10b5-1", action="store_true")
     ap.add_argument("--n-iter", type=int, default=5000)
     ap.add_argument("--beta", type=float, default=1.0)
@@ -281,6 +283,7 @@ def main() -> int:
     events = es.select_insider_events(
         rows, min_notional_usd=args.min_notional, min_price=args.min_price,
         exclude_10b5_1=not args.include_10b5_1, senior_only=args.senior_only,
+        min_insiders=args.min_insiders,
         trading_days=calendar,
     )
     last_bar_day = max(es.trading_days_from_bars(bench_daily))

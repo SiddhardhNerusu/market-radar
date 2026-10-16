@@ -1,11 +1,11 @@
 """MARKET RADAR daemon — long-running orchestrator.
 
-Wires every ingestor, scorer, outcome tracker, T212 snapshotter, and
-notifier into one APScheduler-driven process. Designed to run under
+Wires every ingestor, scorer, outcome tracker, and notifier into one
+APScheduler-driven process. Designed to run under
 launchd: ``KeepAlive=true`` means crashes are restarted automatically.
 
-EXECUTION GATE — when an execution adapter (e.g. T212 CFD) is added,
-EVERY order MUST be evaluated by ``market_radar.risk.RiskManager`` first.
+EXECUTION GATE — EVERY order placed by any execution adapter MUST be
+evaluated by ``market_radar.risk.RiskManager`` first.
 The daemon today is paper-only: nothing in this file places trades.
 The risk manager exists at src/market_radar/risk/manager.py and exposes
 RiskManager().evaluate(TradeProposal(...)) -> RiskDecision; see its
@@ -13,14 +13,26 @@ docstring for the seven hard rules and the fail-closed contract.
 DO NOT bypass the gate when wiring execution.
 
 Schedule (defaults):
-  - SEC EDGAR poll          every 5 min
-  - RSS news poll           every 3 min
-  - Reddit / StockTwits     every 3 min
-  - T212 snapshot           every 5 min (read-only)
-  - Score pending           every 30 sec
+  - SEC EDGAR poll          every 1 min (stub-first)
+  - SEC body hydration      every 20 sec
+  - Form 4 -> insider rows  every 1 min
+  - Alpaca news firehose    every 30 sec
+  - Nasdaq halts            every 1 min
+  - Market movers           every 2 min
+  - Earnings calendar       every 12 hours
+  - Score pending           every 1 min
   - Snapshot outcomes       every 1 min
   - Update due outcomes     every 1 hour
   - Dispatch notifications  every 30 sec (after scoring)
+  - ML predict              every 1 min
+  - LLM classify            every 45 sec
+  - Health check            every 30 min
+  - FINRA short interest    every 12 hours
+  - ClinicalTrials.gov      every 8 hours
+  - Near-dup re-cluster     every 6 hours
+  - Reconcile P&L           every 30 min
+  - ML retrain              weekly Mon 04:00 UTC
+  - Daily assessment        daily 21:35 UTC
 
 All polls run defensively — one failed source never crashes the daemon.
 """
@@ -39,17 +51,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import CONFIG
-from .ingestors import (
-    RedditPublicIngestor,
-    RssNewsIngestor,
-    SecEdgarIngestor,
-    StockTwitsTrendingIngestor,
-)
+from .ingestors import SecEdgarIngestor
 from .notifications import dispatch_pending
 from .outcomes import snapshot_pending_outcomes, update_due_outcomes
 from .scoring import score_pending
 from .storage import init_db
-from .t212.snapshotter import snapshot_all as snapshot_t212
 
 log = logging.getLogger("marketradar.daemon")
 
@@ -61,14 +67,11 @@ log = logging.getLogger("marketradar.daemon")
 DEFAULTS = {
     "sec_edgar_seconds":   60,          # stub-first ingest (no HTTP in poll loop)
     "sec_hydrate_seconds": 20,          # out-of-band SEC body hydration (latency fix)
-    "rss_news_seconds":    3 * 60,
+    "insider_refresh_seconds": 60,      # Form 4 bodies -> insider_transactions (the insider lane's input)
     "alpaca_news_seconds": 30,          # catalyst firehose — tightened 60->30 for latency
     "halts_seconds":       60,          # Nasdaq trading-halt feed — real-time bang detector
     "movers_seconds":      120,         # market-wide top-gainers/most-active — bang scanner
-    "reddit_seconds":      3 * 60,
-    "stocktwits_seconds":  2 * 60,
     "earnings_calendar_seconds": 12 * 60 * 60,  # twice a day — Finnhub free tier
-    "t212_snap_seconds":   5 * 60,
     "scoring_seconds":     60,          # was 30 — a backlog batch ran >30s and overran the tick
                                         # (~8.9k 'max instances reached' warns/audit); 60s fits the window
     "outcome_snap_seconds": 60,
@@ -76,18 +79,12 @@ DEFAULTS = {
     "notify_seconds":      30,
     "ml_predict_seconds":  60,
     "llm_classify_seconds": 45,         # tightened 90->45 — LLM classify is on the catalyst critical path
-    "price_action_seconds": 60,
     "health_check_seconds": 30 * 60,    # stalled-source detector (blueprint #8)
     "finra_short_interest_seconds": 12 * 60 * 60,  # FINRA bi-monthly short interest (#5)
     "clinicaltrials_seconds": 8 * 60 * 60,         # ClinicalTrials.gov v2 readouts (#5)
     "near_dup_seconds": 6 * 60 * 60,               # SimHash near-dup re-cluster (#6)
     "reconcile_pnl_seconds": 30 * 60,              # rebuild bot_daily_pnl realized from Alpaca fills (source of truth)
 }
-
-
-# Cached price-action scanner — instantiated on first call so daemon
-# still loads cleanly when Alpaca creds are missing.
-_PA_SCANNER = None
 
 
 # Cache ingestor instances so their requests.Session (and TCP connection pool)
@@ -133,8 +130,11 @@ def _job_sec_hydrate() -> None:
     from .ingestors.sec_hydrate import hydrate_sec_bodies
     hydrate_sec_bodies()
 
-def _job_rss_news() -> None:
-    _cached("rss_news", RssNewsIngestor).poll()
+def _job_insider_refresh() -> None:
+    """Parse hydrated Form 4 bodies into insider_transactions. This is the
+    insider lane's only signal input, so it runs right behind hydration."""
+    from .ingestors.insider_transactions import refresh_insider_transactions
+    refresh_insider_transactions(limit=200)
 
 def _job_alpaca_news() -> None:
     """Pull the market-wide Alpaca/Benzinga news firehose (every ticker).
@@ -147,17 +147,6 @@ def _job_alpaca_news() -> None:
     from .ingestors.alpaca_news import AlpacaNewsIngestor
     _cached("alpaca_news", AlpacaNewsIngestor).poll()
 
-def _job_reddit() -> None:
-    # Disabled 2026-05-29: Reddit public JSON returns 6,930 HTTP 403s/day
-    # without authentication. Ingestor was silently logging warnings and
-    # contributing zero usable signals. Re-enable when PRAW OAuth is wired.
-    if not CONFIG.has_reddit:
-        return
-    RedditPublicIngestor().poll()
-
-def _job_stocktwits() -> None:
-    StockTwitsTrendingIngestor().poll()
-
 def _job_halts() -> None:
     """Pull the Nasdaq Trader trading-halt feed — the real-time 'this stock is
     banging right now' detector (LULD volatility halts on micro-caps, plus news +
@@ -167,7 +156,7 @@ def _job_halts() -> None:
 
 def _job_movers() -> None:
     """Market-wide top-gainers + most-active scanner — catches the micro-cap bangs
-    the ~85-name price-action scanner is blind to (INHD +1897% etc.). No-ops
+    narrow curated universes are blind to (INHD +1897% etc.). No-ops
     cleanly when Alpaca creds are missing."""
     if not (CONFIG.alpaca_api_key and CONFIG.alpaca_api_secret):
         return
@@ -178,19 +167,6 @@ def _job_earnings_calendar() -> None:
     """Pull next 30 days of US earnings from Finnhub. Runs twice daily."""
     from .ingestors.earnings_calendar import EarningsCalendarIngestor
     _cached("earnings_calendar", EarningsCalendarIngestor).poll()
-
-def _job_t212_snap() -> None:
-    # DEAD PATH (P3 hardening 2026-06-15): T212 is a READ-ONLY snapshot with NO
-    # execution adapter wired (see module docstring) — it polls LIVE-MONEY
-    # credentials on a timer for a path that never trades. Disabled unless the
-    # operator explicitly opts in via ENABLE_T212_SNAPSHOT, so live-money creds
-    # aren't exercised for nothing.
-    import os as _os
-    if _os.getenv("ENABLE_T212_SNAPSHOT", "").strip().lower() not in {"1", "true", "yes", "on"}:
-        return
-    if not CONFIG.has_t212:
-        return
-    snapshot_t212()
 
 def _job_score() -> None:
     score_pending()
@@ -221,27 +197,6 @@ def _job_llm_classify() -> None:
         log.warning("LLM classify skipped: %s", exc)
     except Exception as exc:  # noqa: BLE001
         log.exception("LLM classify job error: %s", exc)
-
-def _job_price_action() -> None:
-    """Scan the liquid equity universe and emit price-action signals.
-
-    No-ops cleanly when Alpaca creds are missing.
-    """
-    if not (CONFIG.alpaca_api_key and CONFIG.alpaca_api_secret):
-        return
-    global _PA_SCANNER
-    try:
-        from .signals import PriceActionScanner
-        if _PA_SCANNER is None:
-            # Equity-only: crypto lane decommissioned (full-audit). The scanner's
-            # crypto_universe defaults to CRYPTO_PAIRS and is scanned even when the
-            # stock market is closed — pass () so no crypto is scanned at SOURCE
-            # (redefining LIQUID_UNIVERSE alone was inert; the scanner reads this param).
-            _PA_SCANNER = PriceActionScanner(crypto_universe=())
-        _PA_SCANNER.run()
-    except Exception as exc:  # noqa: BLE001
-        log.exception("price_action job error: %s", exc)
-
 
 def _job_ml_retrain() -> None:
     from .ml import train_and_save
@@ -389,25 +344,17 @@ def build_scheduler() -> BackgroundScheduler:
     jobs = [
         ("sec_edgar",      _job_sec_edgar,      DEFAULTS["sec_edgar_seconds"]),
         ("sec_hydrate",    _job_sec_hydrate,    DEFAULTS["sec_hydrate_seconds"]),
-        ("rss_news",       _job_rss_news,       DEFAULTS["rss_news_seconds"]),
+        ("insider_refresh", _job_insider_refresh, DEFAULTS["insider_refresh_seconds"]),
         ("alpaca_news",    _job_alpaca_news,    DEFAULTS["alpaca_news_seconds"]),
         ("halts",          _job_halts,          DEFAULTS["halts_seconds"]),
         ("movers",         _job_movers,         DEFAULTS["movers_seconds"]),
-        ("reddit",         _job_reddit,         DEFAULTS["reddit_seconds"]),
-        # DISABLED 2026-06-08: StockTwits is Tier 3 — 0 trades ever, measured negative
-        # edge, and EXCLUDED from corroboration (only Tier 1/2 count). It was ~44% of
-        # scoring volume, backing up the queue for zero trading benefit. Verified safe
-        # to cut. Re-enable by uncommenting this single line.
-        # ("stocktwits",     _job_stocktwits,     DEFAULTS["stocktwits_seconds"]),
         ("earnings_cal",   _job_earnings_calendar, DEFAULTS["earnings_calendar_seconds"]),
-        ("t212_snapshot",  _job_t212_snap,      DEFAULTS["t212_snap_seconds"]),
         ("score",          _job_score,          DEFAULTS["scoring_seconds"]),
         ("outcome_snap",   _job_outcome_snap,   DEFAULTS["outcome_snap_seconds"]),
         ("outcome_update", _job_outcome_update, DEFAULTS["outcome_update_seconds"]),
         ("notify",         _job_notify,         DEFAULTS["notify_seconds"]),
         ("ml_predict",     _job_ml_predict,     DEFAULTS["ml_predict_seconds"]),
         ("llm_classify",   _job_llm_classify,   DEFAULTS["llm_classify_seconds"]),
-        ("price_action",   _job_price_action,   DEFAULTS["price_action_seconds"]),
         ("health_check",   _job_health_check,   DEFAULTS["health_check_seconds"]),
         ("finra_short_int", _job_finra_short_interest, DEFAULTS["finra_short_interest_seconds"]),
         ("clinicaltrials", _job_clinicaltrials, DEFAULTS["clinicaltrials_seconds"]),
@@ -421,7 +368,7 @@ def build_scheduler() -> BackgroundScheduler:
             id=name,
             replace_existing=True,
             # Stagger startup ~3s/job so a restart doesn't fire all ~15 jobs
-            # (50 RSS feeds + SEC + movers + scoring + ML) at once — that thundering
+            # (SEC + movers + scoring + ML) at once — that thundering
             # herd spiked connections/FDs. tz-aware (datetime.utcnow() is deprecated).
             next_run_time=datetime.now(timezone.utc) + timedelta(seconds=i * 3),
         )
@@ -486,11 +433,7 @@ def main() -> int:
     log.info("=" * 70)
     log.info("MARKET RADAR daemon starting")
     log.info("DB:       %s", CONFIG.db_path)
-    log.info("T212:     %s", "configured" if CONFIG.has_t212 else "MISSING")
-    log.info("  invest: %s", "ok" if CONFIG.has_t212_invest else "missing")
-    log.info("  isa:    %s", "ok" if CONFIG.has_t212_isa else "missing")
     log.info("LLM:      %s", "configured" if CONFIG.has_anthropic else "missing (heuristics only)")
-    log.info("Reddit:   %s", "PRAW configured" if CONFIG.has_reddit else "public-JSON only")
     log.info("Notif threshold: %.1f", CONFIG.notification_threshold)
     log.info("=" * 70)
 

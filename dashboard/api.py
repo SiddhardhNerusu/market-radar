@@ -6,7 +6,6 @@ Run from the dashboard via:
 Always prints a single JSON document to stdout. Commands:
 
     overview
-    portfolio
     signals [score_min=0] [source_tier=0] [ticker=""] [limit=100] [offset=0]
     ticker <TICKER>
     edge
@@ -64,26 +63,6 @@ def _emit(payload: dict[str, Any]) -> None:
 def cmd_overview() -> dict[str, Any]:
     """Landing-tile data."""
     with get_connection() as conn:
-        # T212 latest snapshot per account
-        accounts = _rows_to_list(conn.execute(
-            """
-            SELECT t1.*
-            FROM t212_account_snapshots t1
-            JOIN (
-                SELECT account_type, MAX(snapshot_at) AS latest
-                FROM t212_account_snapshots
-                GROUP BY account_type
-            ) t2 ON t1.account_type = t2.account_type AND t1.snapshot_at = t2.latest
-            ORDER BY t1.account_type
-            """
-        ).fetchall())
-
-        # Combined totals
-        total_value = sum((a.get("total_value") or 0) for a in accounts)
-        total_invested = sum((a.get("invested") or 0) for a in accounts)
-        total_pnl = sum((a.get("pnl") or 0) for a in accounts)
-        total_cash = sum((a.get("cash") or 0) for a in accounts)
-
         # Signal counts in last 24h
         signal_counts = _rows_to_list(conn.execute(
             """
@@ -120,90 +99,9 @@ def cmd_overview() -> dict[str, Any]:
         ).fetchall())
 
     return {
-        "totals": {
-            "total_value": total_value,
-            "invested": total_invested,
-            "cash": total_cash,
-            "pnl": total_pnl,
-            "currency": accounts[0]["raw_payload"] if accounts else None,
-            "accounts": accounts,
-        },
         "signal_counts_24h": signal_counts,
         "top_signals": top_signals,
         "daemon_health": health,
-    }
-
-
-# Map dashboard time-range tokens to SQLite ``datetime('now', '-N units')`` strings.
-PORTFOLIO_RANGES: dict[str, Optional[str]] = {
-    "1h":  "-1 hour",
-    "6h":  "-6 hours",
-    "1d":  "-1 day",
-    "1w":  "-7 days",
-    "1mo": "-30 days",
-    "3mo": "-90 days",
-    "6mo": "-180 days",
-    "1y":  "-365 days",
-    "max": None,            # no filter
-}
-
-
-def cmd_portfolio(*, range_token: str = "1d") -> dict[str, Any]:
-    with get_connection() as conn:
-        # Most recent account snapshots
-        accounts = _rows_to_list(conn.execute(
-            """
-            SELECT t1.*
-            FROM t212_account_snapshots t1
-            JOIN (
-                SELECT account_type, MAX(snapshot_at) AS latest
-                FROM t212_account_snapshots
-                GROUP BY account_type
-            ) t2 ON t1.account_type = t2.account_type AND t1.snapshot_at = t2.latest
-            ORDER BY t1.account_type
-            """
-        ).fetchall())
-
-        # Most recent positions per account
-        positions = _rows_to_list(conn.execute(
-            """
-            SELECT p.*
-            FROM t212_positions p
-            JOIN (
-                SELECT account_type, MAX(snapshot_at) AS latest
-                FROM t212_positions
-                GROUP BY account_type
-            ) m ON p.account_type = m.account_type AND p.snapshot_at = m.latest
-            ORDER BY (p.quantity * COALESCE(p.current_price, 0)) DESC
-            """
-        ).fetchall())
-
-        # Equity history — filterable by range_token
-        offset = PORTFOLIO_RANGES.get(range_token, "-1 day")
-        if offset is None:
-            equity = _rows_to_list(conn.execute(
-                """
-                SELECT account_type, snapshot_at, total_value, cash, invested, pnl
-                FROM t212_account_snapshots
-                ORDER BY snapshot_at ASC
-                """
-            ).fetchall())
-        else:
-            equity = _rows_to_list(conn.execute(
-                f"""
-                SELECT account_type, snapshot_at, total_value, cash, invested, pnl
-                FROM t212_account_snapshots
-                WHERE snapshot_at >= datetime('now', '{offset}')
-                ORDER BY snapshot_at ASC
-                """
-            ).fetchall())
-
-    return {
-        "accounts": accounts,
-        "positions": positions,
-        "equity_history": equity,
-        "range_token": range_token,
-        "available_ranges": list(PORTFOLIO_RANGES.keys()),
     }
 
 
@@ -272,7 +170,7 @@ def _get_current_price_for(ticker: str) -> Optional[float]:
     try:
         import yfinance as yf  # type: ignore
         sym = ticker.upper()
-        if "_" in sym:  # T212 shape AAPL_US_EQ → AAPL
+        if "_" in sym:  # legacy broker shape AAPL_US_EQ → AAPL
             sym = sym.split("_")[0]
         info = yf.Ticker(sym).fast_info
         price = getattr(info, "last_price", None)
@@ -300,21 +198,6 @@ def cmd_ticker(ticker: str) -> dict[str, Any]:
             LIMIT 200
             """,
             (ticker,),
-        ).fetchall())
-
-        # Position info (latest snapshot, any account)
-        positions = _rows_to_list(conn.execute(
-            """
-            SELECT p.*
-            FROM t212_positions p
-            JOIN (
-                SELECT account_type, MAX(snapshot_at) AS latest
-                FROM t212_positions
-                GROUP BY account_type
-            ) m ON p.account_type = m.account_type AND p.snapshot_at = m.latest
-            WHERE p.ticker LIKE ?
-            """,
-            (f"{ticker}\\_%",),  # match T212 ticker shape AAPL_US_EQ
         ).fetchall())
 
         # Aggregate stats
@@ -361,7 +244,6 @@ def cmd_ticker(ticker: str) -> dict[str, Any]:
     return {
         "ticker": ticker,
         "signals": signals,
-        "positions": positions,
         "stats": dict(agg) if agg else {},
         "projection": projection_data,
     }
@@ -551,37 +433,14 @@ def _measured_edge(
     return None, 0
 
 
-def _t212_holdings(conn) -> set[str]:
-    """Latest T212 positions across all accounts, as a set of base tickers."""
-    rows = conn.execute(
-        """
-        SELECT DISTINCT ticker
-        FROM t212_positions p
-        JOIN (
-            SELECT account_type, MAX(snapshot_at) AS latest
-            FROM t212_positions GROUP BY account_type
-        ) m ON p.account_type = m.account_type AND p.snapshot_at = m.latest
-        """
-    ).fetchall()
-    out: set[str] = set()
-    for row in rows:
-        t = (row["ticker"] or "").upper()
-        # T212 ticker shape e.g. AAPL_US_EQ → AAPL
-        base = t.split("_")[0] if "_" in t else t
-        if base:
-            out.add(base)
-    return out
-
-
 def cmd_grouped(*, limit_per_group: int = 10) -> dict[str, Any]:
     """Return signals grouped by action label (STRONG_BUY, BUY, etc).
 
     Each signal gets its action label computed inline with measured-edge
-    data and T212 holdings awareness. Within each group, signals are
-    sorted by composite_score descending.
+    data. Within each group, signals are sorted by composite_score descending.
     """
     with get_connection() as conn:
-        holdings = _t212_holdings(conn)
+        holdings: set[str] = set()  # no broker-holdings feed wired
         # Pull the top-N live signals (last 24h, scored only) — the backfill
         # rows have published_at far in the past, so they don't appear in
         # this feed but DO power the measured-edge stats.
@@ -677,7 +536,6 @@ def cmd_grouped(*, limit_per_group: int = 10) -> dict[str, Any]:
         "groups": groups,
         "priority": priority,
         "counts": {k: len(v) for k, v in groups.items()},
-        "t212_holdings": sorted(holdings),
     }
 
 
@@ -689,12 +547,8 @@ def cmd_metadata() -> dict[str, Any]:
             "scored_total": conn.execute("SELECT COUNT(*) AS n FROM signal_scores").fetchone()["n"],
             "outcomes_total": conn.execute("SELECT COUNT(*) AS n FROM signal_outcomes").fetchone()["n"],
             "outcomes_resolved": conn.execute("SELECT COUNT(*) AS n FROM signal_outcomes WHERE fully_resolved = 1").fetchone()["n"],
-            "t212_snapshots": conn.execute("SELECT COUNT(*) AS n FROM t212_account_snapshots").fetchone()["n"],
             "configured": {
-                "t212_invest": CONFIG.has_t212_invest,
-                "t212_isa": CONFIG.has_t212_isa,
                 "anthropic": CONFIG.has_anthropic,
-                "reddit_praw": CONFIG.has_reddit,
             },
         }
 
@@ -734,8 +588,6 @@ def main(argv: list[str]) -> int:
             _emit(cmd_overview())
         elif cmd == "grouped":
             _emit(cmd_grouped())
-        elif cmd == "portfolio":
-            _emit(cmd_portfolio())
         elif cmd == "signals":
             kwargs = _parse_kwargs(rest)
             _emit(cmd_signals(**kwargs))

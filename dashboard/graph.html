@@ -55,7 +55,6 @@ h1 { margin: 0 0 6px 0; font-size: 18px; color: var(--accent-buy); }
 .chip { display: inline-block; padding: 2px 8px; border-radius: 11px;
     background: #2a3346; color: var(--fg); font-size: 10px; }
 .chip.sector { background: #163020; color: #9be38f; }
-.chip.crypto { background: #2a1830; color: #e69eff; }
 
 .empty { padding: 22px 18px; color: var(--muted); font-style: italic; font-size: 13px; }
 .detail { background: var(--panel-2); border-top: 1px solid var(--border);
@@ -98,7 +97,7 @@ h1 { margin: 0 0 6px 0; font-size: 18px; color: var(--accent-buy); }
     <h1>Graph-only model — ranked view</h1>
     <div class="muted">
         Top tickers ranked by the graph-only model (sector peers, co-mentions,
-        cross-asset, crypto sympathy — no news, no sentiment, no event type).
+        cross-asset sympathy — no news, no sentiment, no event type).
         Sample drawn from the last 48 hours of live signals.
     </div>
 
@@ -181,7 +180,6 @@ async function loadColumn(direction, container, summary){
             const chips = [];
             (d.sector_peers || []).slice(0,4).forEach(t => chips.push(`<span class="chip sector">${esc(t)}</span>`));
             (d.co_mention_peers || []).slice(0,4).forEach(t => chips.push(`<span class="chip">${esc(t)}</span>`));
-            if (d.is_crypto_correlated) chips.push('<span class="chip crypto">crypto-corr</span>');
             el.innerHTML = chips.join('') || '<span class="muted" style="font-size:10px">no peer data</span>';
         });
     });
@@ -210,9 +208,6 @@ function renderDetail(d){
     if (d.graph_only_model){
         html += `<h4>Graph-only model</h4>
           <div>version ${esc(d.graph_only_model.version || '—')} · val_auc ${num(d.graph_only_model.val_auc)}</div>`;
-    }
-    if (d.is_crypto_correlated){
-        html += `<h4>Crypto-correlated</h4><div>Treated as BTC-sensitive — BTC 5-day return feeds in as a feature.</div>`;
     }
     html += `<h4>Sector peers</h4>
       <div>${(d.sector_peers||[]).map(t => `<span class="chip sector">${esc(t)}</span>`).join('') || '<span class="muted">none</span>'}</div>`;

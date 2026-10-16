@@ -179,7 +179,7 @@ Open a Google Sheet with these columns:
 
 For each Telegram alert:
 1. Add a row immediately when it fires (timestamp + ticker + p%)
-2. Look up entry price in T212 app or yfinance
+2. Look up entry price in your broker app or yfinance
 3. Come back in 1-5 days and fill in the returns
 4. Mark "Hit = 1" if the direction was right (buy went up / sell went down)
 

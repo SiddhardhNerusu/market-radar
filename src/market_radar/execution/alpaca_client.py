@@ -476,6 +476,36 @@ class AlpacaClient:
         return _to_order(self._request("GET", f"/v2/orders/{order_id}",
                                        params={"nested": "true"}))
 
+    def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
+        """Look an order up by OUR id. This is how the insider lane recovers an
+        idempotent submit after a crash: the pending_submit row carries the
+        deterministic client_order_id, so on restart we ask the broker whether
+        it exists before ever re-submitting. Returns None on 404."""
+        try:
+            d = self._request("GET", "/v2/orders:by_client_order_id",
+                              params={"client_order_id": client_order_id})
+        except AlpacaError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return _to_order(d) if d else None
+
+    def cancel_open_orders_for(self, symbol: str) -> int:
+        """Cancel every open order on ``symbol`` (e.g. the bracket legs before a
+        time-stop close, which Alpaca would otherwise reject as 'insufficient
+        qty available' because the legs hold the shares). Returns the count."""
+        n = 0
+        for o in self.list_orders(status="open", limit=500, nested=False):
+            if o.symbol.upper() != symbol.upper():
+                continue
+            try:
+                self.cancel_order(o.id)
+                n += 1
+            except AlpacaError as exc:
+                if exc.status != 404 and exc.status != 422:
+                    raise
+        return n
+
     def list_account_activities(
         self,
         *,

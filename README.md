@@ -19,88 +19,58 @@ Bonferroni correction). The paper-trading bot lost money over 26 trading days. a
 
 ---
 
-## What it does
+## What it does now (October 2026: the insider lane)
+
+After the research below found no edge in any catalyst family, the system was
+narrowed to the one candidate that was theory-backed and positive at the median,
+built so that a forward record can settle it:
 
 ```
-                         ┌──────────────────────────────────────────────────────────┐
-                         │                 SIGNAL DAEMON  (launchd, 24/7)           │
-  SEC EDGAR 8-K/13D/S-1/ │                                                          │
-  Form 4/6-K ──────────► │  ingestors/  ─► raw_signals ─► dedup/ (SimHash + LSH)    │
-  FDA, clinical trials,  │       │                              │                   │
-  earnings, FINRA short  │       ▼                              ▼                   │
-  interest, halts ─────► │  llm/  Claude Haiku classifier   scoring/  composite     │
-  news RSS, Alpaca news, │  (event type, sentiment,          (source weight,        │
-  Reddit, StockTwits ──► │   factual?, tool-use JSON)         corroboration,        │
-                         │       │                            anti-pump heuristics) │
-  1-min bars (85 stocks) │       ▼                              │                   │
-  ──► price-action ────► │  ml/   stacked HGB + LightGBM ─► isotonic calibration    │
-       scanner           │        walk-forward CV        ─► split-conformal bands   │
-                         │        ─► selective gate  ─► signal_scores               │
-                         │                                      │                   │
-                         │  outcomes/  snapshot price at flag, re-check at          │
-                         │             1d / 5d / 20d ─► signal_outcomes             │
-                         └──────────────────────────────┬───────────────────────────┘
-                                                        │ SQLite (WAL)
-                         ┌──────────────────────────────▼───────────────────────────┐
-                         │                 LIVE TRADER  (30 s loop, paper only)     │
-                         │  snapshot broker state ─► reconcile orders/positions     │
-                         │  ─► macro regime gate (VIX, SPY trend, yield curve)      │
-                         │  ─► candidates ─► conformal gate ─► ATR stops            │
-                         │  ─► fractional-Kelly sizing ─► 8-rule risk manager       │
-                         │  ─► single order gateway ─► Alpaca (stock bracket /      │
-                         │      vertical debit spread / crypto)                     │
-                         │  ─► fills-based FIFO P&L reconciliation ─► Telegram      │
-                         └──────────────────────────────────────────────────────────┘
-                                                        │
-                         Flask dashboard (localhost) ◄──┘  edge-research scripts (scripts/edge_*.py)
+  SEC EDGAR Form 4 ──► sec_edgar / sec_hydrate ──► insider_transactions (every minute)
+                                                          │
+                    ┌─────────────────────────────────────▼──────────────────────────┐
+                    │ INSIDER LANE  (src/market_radar/lane/, 60 s loop, paper only)   │
+                    │  code-P open-market buys ≥ $25k, ≥ $10 names, no 10b5-1 plans   │
+                    │  one bet per (ticker, event_day), anchored on published_at      │
+                    │  ─► IEX quote, spread cap ─► ATR(14) ─► 0.5% of book at risk   │
+                    │  ─► order gateway (long-only, hard/per-symbol/gross caps)       │
+                    │  ─► BRACKET at the broker: 2×ATR stop, 2R target, GTC           │
+                    │  ─► time stop 14 d, 3% daily-loss FLATTEN, ≤5 names, 5% heat   │
+                    │  ─► edge_ledger row for EVERY qualifying event, traded or not   │
+                    └────────────────────────────────────────────────────────────────┘
+                                                          │
+             scripts/edge_ledger_update.py ─► 5d/20d SPY-adjusted returns ─► promotion gate
+             scripts/event_study_form4.py  ─► published_at-anchored historical event study
 ```
 
-### Scale of the data it has processed
+- `lane/trader.py` is ~470 lines and replaces the 4,857-line `live_trader.py`.
+- Sizing is risk-based (`qty = risk$ / stop distance`), not Kelly fed a hard-coded p.
+- The stop exists at the broker from the moment of fill. The old bot's configured
+  ATR stop was never enforced during regular hours.
+- Dedup and re-entry guards are database rows, not in-memory dicts lost on restart.
+- Submits are idempotent via a deterministic `client_order_id` recovered from the broker.
+- The promotion gate (`lane/promotion.py`) is code: ≥15 distinct days, median > 0,
+  trimmed mean > 0, drop-top-10% > 0, early and late halves > 0, day-cluster
+  bootstrap p < 0.05 / families. See `docs/INSIDER_LANE.md`.
 
-| | |
-|---|---|
-| Raw signals ingested | 1.24 M |
-| Distinct sources | 81 |
-| Signals scored | 711 k |
-| Resolved 5-day forward outcomes | 426 k across 10.8 k tickers |
-| LLM classifications | 10 k |
-| Trader decisions logged (placed / blocked / no-quote, with reason) | 32 k |
+Removed in the same change: options, crypto, shorts, the price-action scanner,
+RSS/Reddit/StockTwits ingestion, Trading 212, and ~10k lines with them.
 
----
-
-## The interesting parts
-
-### Signal ingestion
-- **SEC EDGAR** parser for 8-K (with item-code extraction), 13D/G, S-1, Form 4 (insider trades, 10b5-1 plan detection) and 6-K foreign-issuer filings, with body hydration and CIK→ticker lookup.
-- **ClinicalTrials.gov**, FDA calendar, earnings calendar, FINRA bi-monthly short interest, Nasdaq trading halts, market-movers scanner, RSS news wires, Alpaca news firehose, Reddit and StockTwits.
-- **Near-duplicate collapse** with SimHash fingerprints and LSH-banded union-find clustering (`dedup/near_dup.py`), because exact hashing left ~93 % of re-syndicated stories looking "distinct".
-- **Price-action scanner** over 1-minute bars: opening-range breakout, VWAP cross, Donchian breakout, RSI extremes, volume spikes, gap-and-go.
-
-### LLM classification
-- Claude Haiku with tool-use (structured JSON output) tags every signal with event type, sentiment, and whether it is factual or speculative. A deterministic pre-classifier handles SEC form types so the LLM is only paid for ambiguous text. Daily spend is tracked and capped.
-
-### Machine learning
-- **Stacked ensemble** (`ml/ensemble.py`): HistGradientBoosting + LightGBM base learners with a logistic meta-learner on out-of-fold predictions. An earlier logistic base learner was removed after it scored below random on the mixed-scale feature matrix.
-- **Walk-forward validation** (`ml/train.py`): expanding-window `TimeSeriesSplit`, median fold AUC as the published metric, fold variance as a regime-fragility signal. Isotonic calibration on the final model. Latest deployed 5-day model: validation AUC 0.72 on a 745-row slice, so the error bars are wide.
-- **Split-conformal prediction** (`ml/conformal.py`): distribution-free intervals around calibrated probabilities; the **selective gate** (`ml/selective_gate.py`) only lets a trade through when p is high *and* the interval is narrow.
-- **Learning-to-rank** (`ml/ranker.py`): a day-demeaned LGBMRanker that asks "which bets outrank the others today" instead of "will this bet win", with a hard data-volume deploy gate that provably refuses to promote a model until enough distinct clean days exist.
-- **Drift monitoring**, weekly automated retrain with an AUC gate (a new model only deploys if it beats the incumbent; `model_history.md` is the audit log of every retrain decision).
-
-### Risk, sizing and execution
-- **Fractional Kelly sizing** (`execution/sizer.py`): quarter-Kelly from calibrated p and the ATR-derived reward:risk, capped by a max position percentage, with fail-closed guards.
-- **8-rule risk manager** (`risk/manager.py`, `execution/live_risk.py`): emergency stop, daily loss kill-switch, monthly drawdown halt, model-drift block, minimum calibrated probability, daily trade cap, gross exposure cap, per-ticker / per-sector / pile-on concentration caps. The live variant reads exposure from the broker, not the local database.
-- **Macro regime gate** (`signals/macro_regime.py`): VIX, SPY trend, 10y–2y spread and breadth combine into halt / shrink / boost multipliers.
-- **Options** (`execution/options/`): OCC symbol math, multi-leg order submission, vertical debit-spread construction (ATM long, ~0.25-delta short, 10–21 DTE), liquidity and earnings filters, asymmetric Kelly contract sizing, and exit rules at 30 % of max gain / 50 % of max loss / 1-DTE / max-hold.
-- **Single order gateway** (`execution/order_gateway.py`): every path that can short, flip or oversize goes through one choke point. This exists because of an incident on the paper account where a long that had been flipped short kept "selling to close", doubling from 63 to 16,128 shares on a ~$6k book. The fix was a structural invariant, not a patch at the symptom site, plus regression tests.
-- **Fills-based P&L reconciliation** (`execution/pnl_reconcile.py`): the broker's actual fills are matched FIFO into realized P&L, deterministically, after the per-trade ledger was found to capture only a fraction of real losses. Idempotent rebuilds; the equity curve is treated as the only honest P&L.
-- Other production fixes worth reading: DST handling via `zoneinfo`, idempotent submits via a `pending_submit` row, orphan-position adoption, stale-quote refetch before bracket submission, cancel-all-before-flatten at end of day.
-
-### Operations
-- Nine `launchd` jobs (daemon, trader, health check, drift check, weekly retrain, P&L reconcile, digest, backup, keep-awake) with install scripts.
-- Local Flask dashboard with signal feed, per-ticker drill-down, measured hit rate per signal class, and bot status.
-- Telegram alerts with de-duplication.
-
----
+### Still in the repo (the research platform)
+- **SEC EDGAR** parser for 8-K (item codes), 13D/G, S-1, Form 4 (10b5-1 detection) and 6-K,
+  with body hydration and CIK→ticker lookup; ClinicalTrials.gov, FDA calendar, earnings
+  calendar, FINRA short interest, Nasdaq halts, market movers, Alpaca news.
+- **Near-duplicate collapse** with SimHash + LSH (`dedup/near_dup.py`).
+- **LLM classification** (Claude Haiku, tool-use JSON) behind a deterministic SEC pre-classifier.
+- **ML** (`ml/`): stacked HGB + LightGBM, walk-forward CV, isotonic calibration, split-conformal
+  bands, learning-to-rank with a data-volume deploy gate, drift monitoring. The lane does
+  not consume any of it; it is kept as the research track, with its known leakage
+  (same-day bars in features, train/serve skew) documented in `MARKET_RADAR_ASSESSMENT.md`.
+- **Fills-based P&L reconciliation** (`execution/pnl_reconcile.py`): FIFO over the broker's
+  actual fills; the equity curve is the only honest P&L.
+- **Single order gateway** (`execution/order_gateway.py`): every open and close goes through
+  one choke point with reduce-only-by-live-sign, long-only and hard caps. It exists because
+  of the TRDA incident described below.
 
 ## Results, honestly
 
@@ -143,15 +113,17 @@ src/market_radar/
 ├── scoring/       composite score, heuristics, impact tables, source weights
 ├── ml/            features, ensemble, training (walk-forward), conformal, ranker, drift
 ├── outcomes/      forward-return tracking at 1d / 5d / 20d
-├── signals/       price-action scanner, macro regime, confluence
+├── signals/       macro regime
 ├── risk/          rule-based risk manager
-├── execution/     Alpaca client, sizer, live trader, order gateway, P&L reconcile, options/
+├── execution/     Alpaca client, sizer (ATR), order gateway, P&L reconcile
+├── lane/          THE INSIDER LANE: config, candidates, sizing, ledger, promotion gate, trader
+├── research/      published_at-anchored event study (pure functions)
 ├── backtest/      replay harness with cost model
 ├── notifications/ Telegram + macOS
 ├── storage/       SQLite access layer (WAL, schema loading)
 └── daemon.py      APScheduler job graph
-scripts/           CLI tools, backfills, and the edge_*.py research gauntlet
-tests/             103 pytest tests (run without a database or broker keys)
+scripts/           run_insider_lane.py, edge_ledger_update.py, event_study_form4.py, backfills, edge_*.py
+tests/             pytest suite (runs without a database or broker keys)
 dashboard/         Flask server + HTML
 sql/               schema files
 launchd/           macOS job definitions
@@ -166,9 +138,11 @@ pip install -r requirements.txt          # or requirements-ci.txt for tests only
 cp .env.example .env                     # fill in keys; leave blank to run the free/heuristic path
 python scripts/init_db.py
 PYTHONPATH=src python scripts/run_daemon.py
-PYTHONPATH=src python scripts/run_live_trader.py --paper   # paper account only
+PYTHONPATH=src python scripts/run_insider_lane.py --paper --dry-run --once   # what would it do
+PYTHONPATH=src python scripts/run_insider_lane.py --paper                    # paper account only
+PYTHONPATH=src python scripts/edge_ledger_update.py                          # forward record + gate
 python dashboard/server.py               # http://localhost:8765
-pytest                                   # 103 tests
+pytest
 ```
 
 The daemon, trader and dashboard all read `data/market_radar.db`; the database, model artefacts, logs and `.env` are git-ignored.

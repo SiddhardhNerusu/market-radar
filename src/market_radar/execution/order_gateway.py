@@ -7,6 +7,8 @@ The 2026-06-10 TRDA death spiral (a long stock that flipped short, then every
 symptom-site patch is not enough; the invariant must live in ONE place.
 
 ROUTED THROUGH THIS GATEWAY (where a short/flip/oversize is possible):
+  - the insider lane's bracket entry (submit_bracket) and its time-stop /
+    daily-loss closes (intent=CLOSE).
   - stock entry, stock refill, stock RTH/extended-hours exit, crypto entry.
   - every scheduled stock flatten close: the daily profit-take / loss-stop, the
     EOD "no overnight holds" flatten, and the rogue-orphan flatten — each routed
@@ -261,6 +263,51 @@ class OrderGateway:
             client_order_id=client_order_id,
             position_intent=plan.position_intent,
             extended_hours=extended_hours,
+        )
+
+    def submit_bracket(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        limit_price: float,
+        take_profit: float,
+        stop_loss: float,
+        time_in_force: str = "gtc",
+        client_order_id: Optional[str] = None,
+        positions: Any = None,
+    ):
+        """Long-only BRACKET entry (insider lane). Validates exactly like an
+        OPEN through :func:`plan_order` (long-only, hard / per-symbol / gross
+        caps, fail-closed on a missing positions snapshot) and then submits a
+        marketable-limit parent with broker-side stop + target legs, so the
+        protective stop exists the instant the parent fills — no poller, no
+        sleeping-Mac gap. Returns the BracketOrder or ``None`` if refused."""
+        poss = self._live_positions(positions)
+        if poss is None:
+            msg = f"gateway REFUSED bracket {symbol}: no live positions snapshot (fail-closed)"
+            log.error(msg)
+            self._notify(msg)
+            return None
+        plan = plan_order(
+            intent=OPEN, symbol=symbol, requested_side="buy", requested_qty=qty,
+            ref_price=limit_price, positions=poss, caps=self.caps,
+        )
+        if not plan.allowed:
+            log.error("gateway BLOCKED bracket: %s", plan.reason)
+            self._notify(f"gateway BLOCKED: {plan.reason}")
+            return None
+        if not (stop_loss < limit_price < take_profit):
+            msg = (f"gateway BLOCKED bracket {symbol}: stop {stop_loss} < entry "
+                   f"{limit_price} < target {take_profit} must hold")
+            log.error(msg)
+            self._notify(msg)
+            return None
+        return self.alpaca.submit_bracket_order(
+            symbol=symbol, side="buy", qty=plan.qty,
+            take_profit=take_profit, stop_loss=stop_loss,
+            limit_price=limit_price, time_in_force=time_in_force,
+            client_order_id=client_order_id,
         )
 
     def _notify(self, msg: str) -> None:

@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from market_radar.ingestors import RssNewsIngestor, SecEdgarIngestor  # noqa: E402
+from market_radar.ingestors import SecEdgarIngestor  # noqa: E402
 from market_radar.storage import get_connection, init_db  # noqa: E402
 
 
@@ -28,15 +28,11 @@ def main() -> int:
     init_db()
 
     sec = SecEdgarIngestor()
-    rss = RssNewsIngestor()
 
     print("Polling SEC EDGAR …")
     r1 = sec.poll()
     print(f"  fetched={r1.fetched} inserted={r1.inserted} dup={r1.duplicates} err={r1.errors}")
 
-    print("Polling RSS news …")
-    r2 = rss.poll()
-    print(f"  fetched={r2.fetched} inserted={r2.inserted} dup={r2.duplicates} err={r2.errors}")
     print()
 
     with get_connection() as conn:

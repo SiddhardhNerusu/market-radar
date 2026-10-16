@@ -109,8 +109,7 @@ def _ensure_table(db: str) -> None:
 
 def _last_alert_minutes_ago(db: str, kind_prefix: Optional[str] = None) -> float:
     """Minutes since the last alert. Optionally scoped to a kind prefix so the
-    daemon and livetrader watchdogs keep INDEPENDENT cooldowns (a daemon alert
-    must not suppress a livetrader alert). Returns a large number if none."""
+    different watchdogs keep INDEPENDENT cooldowns. Returns a large number if none."""
     try:
         with get_connection() as con:
             if kind_prefix:
@@ -140,72 +139,6 @@ def _record(db: str, kind: str) -> None:
             )
     except Exception as exc:  # noqa: BLE001
         logging.warning("record alert failed: %s", exc)
-
-
-LIVETRADER_LABEL = "com.marketradar.livetrader"
-HEARTBEAT_STALE_MIN = 15.0  # snapshot_at older than this => the loop is hung
-
-
-def _heartbeat_minutes_ago(db: str) -> Optional[float]:
-    """Minutes since the livetrader last wrote a bot_account_snapshots row.
-    The loop snapshots the account every iteration (~30s), 24/7 (crypto runs
-    on weekends too), so a stale heartbeat reliably means the trader is dead
-    or hung — not just 'market closed'. None if the table is empty/unreadable."""
-    try:
-        with get_connection() as con:
-            row = con.execute(
-                "SELECT snapshot_at FROM bot_account_snapshots ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-        if not row or not row[0]:
-            return None
-        ts = str(row[0]).replace("Z", "+00:00")
-        last = datetime.fromisoformat(ts)
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - last).total_seconds() / 60.0
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("heartbeat read failed: %s", exc)
-        return None
-
-
-def _check_livetrader(db: str) -> int:
-    """Alert if the LIVE TRADER process is down OR its heartbeat is stale.
-    This is the gap the old health-check missed — it only watched the daemon,
-    so the trader could die silently and no trades would fire all day.
-    Returns 0 healthy, 1 unhealthy."""
-    pid = _launchctl_pid(LIVETRADER_LABEL)
-    proc_alive = pid is not None and _running(pid)
-    restart = "launchctl kickstart -k gui/$(id -u)/com.marketradar.livetrader"
-
-    if not proc_alive:
-        logging.warning("livetrader not running (launchctl reports no %s)", LIVETRADER_LABEL)
-        if _last_alert_minutes_ago(db, "livetrader") > COOLDOWN_MIN:
-            if _send_telegram(
-                "🛑 <b>MARKET RADAR — LIVE TRADER not running</b>\n"
-                "No trades will fire. Restart with:\n"
-                f"<code>{restart}</code>"
-            ):
-                _record(db, "livetrader_down")
-        return 1
-
-    hb = _heartbeat_minutes_ago(db)
-    if hb is not None and hb > HEARTBEAT_STALE_MIN:
-        logging.warning("livetrader heartbeat stale: %.1f min", hb)
-        if _last_alert_minutes_ago(db, "livetrader") > COOLDOWN_MIN:
-            if _send_telegram(
-                "⚠️ <b>MARKET RADAR — LIVE TRADER stalled</b>\n"
-                f"Process alive (PID {pid}) but no account snapshot for "
-                f"{hb:.0f} min — the loop is hung. Trades may not be firing.\n"
-                f"Restart: <code>{restart}</code>"
-            ):
-                _record(db, "livetrader_stalled")
-        return 1
-
-    logging.info(
-        "Livetrader PID %s healthy (heartbeat %.1f min ago)",
-        pid, hb if hb is not None else -1.0,
-    )
-    return 0
 
 
 def _check_daemon(db: str) -> int:
@@ -273,11 +206,8 @@ def main() -> int:
     from market_radar.config import CONFIG
     db = str(CONFIG.db_path)
     _ensure_table(db)
-    # Check BOTH the daemon (signal ingestion) and the live trader (order
-    # loop). Either being down is a silent failure the user must know about.
     rc_daemon = _check_daemon(db)
-    rc_trader = _check_livetrader(db)
-    return 0 if (rc_daemon == 0 and rc_trader == 0) else 1
+    return 0 if rc_daemon == 0 else 1
 
 
 if __name__ == "__main__":

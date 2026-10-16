@@ -21,10 +21,8 @@ trust those directly rather than scraping tickers from the headline. Broad
 so they don't generate per-ticker scoring noise — the real catalyst PRs carry
 1-3 symbols (VERU's Novo deal tagged ``[NVO, VERU]``).
 
-NOTE (eyes-only): downstream, ``alpaca_news`` is in the live trader's default
-``LIVE_BLOCKED_SOURCES`` — these signals are scored + alerted but NOT traded
-until the edge is validated and a min-price/liquidity gate is added. See
-``live_trader.LiveTraderConfig.blocked_sources``.
+NOTE (eyes-only): these signals are scored + alerted but NOT traded — the
+only execution lane is the Form 4 insider-purchase lane.
 
 Docs: https://docs.alpaca.markets/reference/news-3
 """

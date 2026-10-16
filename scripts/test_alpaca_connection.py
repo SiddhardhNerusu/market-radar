@@ -87,7 +87,7 @@ def main() -> int:
         print("       (no quote — data feed may not be enabled on this key)")
 
     print(f"\n{GREEN}{BOLD}All connection tests passed.{RESET}")
-    print(f"{DIM}Next: python scripts/run_live_trader.py --dry-run --once{RESET}")
+    print(f"{DIM}Next: python scripts/run_insider_lane.py --help{RESET}")
     return 0
 
 

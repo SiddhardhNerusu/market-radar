@@ -48,7 +48,15 @@ def event_day_for(published_at: str) -> Optional[str]:
     """The ET trading date on which a filing published at ``published_at``
     first becomes tradeable: same day if before the close, otherwise the
     next weekday. Returns 'YYYY-MM-DD' or None if unparseable."""
-    d = parse_iso(published_at)
+    s = str(published_at or "").strip()
+    if len(s) == 10:
+        # Date-only stamp (e.g. the SEC bulk data sets): the clock time is
+        # unknown, so assume the filing landed after the close. Conservative.
+        try:
+            return next_weekday(date.fromisoformat(s)).isoformat()
+        except ValueError:
+            return None
+    d = parse_iso(s)
     if d is None:
         return None
     et = to_et(d)

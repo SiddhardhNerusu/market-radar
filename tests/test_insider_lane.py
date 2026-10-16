@@ -32,6 +32,8 @@ def test_event_day_rolls_after_close_and_over_weekend():
     assert event_day_for("2026-06-12T22:00:00Z") == "2026-06-15"      # Fri evening -> Mon
     assert event_day_for("2026-06-13T15:00:00Z") == "2026-06-15"      # Saturday -> Mon
     assert event_day_for("garbage") is None
+    assert event_day_for("2026-06-10") == "2026-06-11"                 # date-only => after close
+    assert event_day_for("2026-06-12") == "2026-06-15"                 # Friday date-only => Monday
 
 
 def test_entry_window_excludes_open_and_close():

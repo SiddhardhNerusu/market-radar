@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.marketradar.edgeledger</string>
+
+    <!-- Resolve edge_ledger 5d/20d returns and print the promotion-gate verdict.
+         22:30 local: after the US close so the day's bar is final. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__PROJECT_ROOT__/scripts/edge_ledger_update.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>22</integer>
+        <key>Minute</key><integer>30</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/MarketRadar/edgeledger.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/MarketRadar/edgeledger.err.log</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

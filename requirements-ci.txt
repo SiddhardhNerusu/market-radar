@@ -16,5 +16,4 @@ anthropic
 pydantic
 yfinance
 flask
-praw
 joblib

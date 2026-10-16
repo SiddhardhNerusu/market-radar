@@ -3,10 +3,7 @@ from .alpaca_news import AlpacaNewsIngestor
 from .base import Ingestor, ParsedSignal, PollResult, TickerMention
 from .halts import NasdaqHaltsIngestor
 from .market_movers import MarketMoversIngestor
-from .reddit_public import RedditPublicIngestor
-from .rss_news import RssNewsIngestor
 from .sec_edgar import SecEdgarIngestor
-from .stocktwits import StockTwitsTrendingIngestor
 from .ticker_extractor import TICKER_EXTRACTOR, TickerExtractor
 
 __all__ = [
@@ -15,9 +12,6 @@ __all__ = [
     "PollResult",
     "TickerMention",
     "SecEdgarIngestor",
-    "RssNewsIngestor",
-    "RedditPublicIngestor",
-    "StockTwitsTrendingIngestor",
     "AlpacaNewsIngestor",
     "NasdaqHaltsIngestor",
     "MarketMoversIngestor",

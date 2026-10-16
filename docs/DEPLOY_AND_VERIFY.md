@@ -25,7 +25,6 @@ launchctl unload ~/Library/LaunchAgents/com.marketradar.daemon.plist
 launchctl load   ~/Library/LaunchAgents/com.marketradar.daemon.plist
 # init_db() runs on start and applies the new columns (dup_cluster_id, is_10b5_1, etc.)
 ```
-Leave **com.marketradar.livetrader** OFF — no live trading until an edge is proven.
 
 ## 3. One-time data backfills (idempotent; safe to re-run)
 ```bash

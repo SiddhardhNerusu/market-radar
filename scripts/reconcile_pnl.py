@@ -1,8 +1,8 @@
 """Post-close ledger reconcile — rebuild bot_daily_pnl realized columns from
 Alpaca's ACTUAL equity fills (full-audit rebuild ch2, the source of truth).
 
-Why this exists: bot_daily_pnl was historically written ONLY by
-LiveTrader._update_daily_pnl — a running SUM of ESTIMATED per-exit P&L that
+Why this exists: bot_daily_pnl was historically written ONLY by the old
+live trader's _update_daily_pnl — a running SUM of ESTIMATED per-exit P&L that
 silently dropped a whole class of closes (bracket stops, extended-hours, closes
 while the bot was down) and accumulated float drift (e.g. -47.7672). The honest
 forward fix lives in market_radar.execution.pnl_reconcile: FIFO-match the broker's

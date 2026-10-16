@@ -233,7 +233,7 @@ def run_backtest(cfg: BacktestConfig) -> BacktestResult:
 
 
 # ---------------------------------------------------------------------------
-# Candidate fetch (mirrors live_trader._fetch_candidates)
+# Candidate fetch (mirrors the old live trader's _fetch_candidates)
 # ---------------------------------------------------------------------------
 
 def _fetch_candidates(cfg: BacktestConfig) -> list[dict]:

@@ -51,8 +51,6 @@ pandas==3.0.3
 peewee==4.0.5
 platformdirs==4.9.6
 pluggy==1.6.0
-praw==7.8.1
-prawcore==2.4.0
 propcache==0.5.2
 protobuf==7.34.1
 pycparser==3.0
@@ -90,7 +88,6 @@ typer==0.25.1
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzlocal==5.3.1
-update-checker==0.18.0
 urllib3==2.7.0
 websocket-client==1.9.0
 websockets==16.0

@@ -69,12 +69,11 @@ def create_app() -> Flask:
         # 2. Co-mention peers from a fresh graph
         try:
             from market_radar.ml.graph_features import (
-                build_co_mention_graph, SECTOR_PEERS, CRYPTO_CORRELATED,
+                build_co_mention_graph, SECTOR_PEERS,
             )
             peers = build_co_mention_graph(days=90, top_k=5)
             out["co_mention_peers"] = peers.get(ticker.upper(), [])
             out["sector_peers"] = SECTOR_PEERS.get(ticker.upper(), [])
-            out["is_crypto_correlated"] = ticker.upper() in CRYPTO_CORRELATED
         except Exception as exc:
             out["co_mention_error"] = str(exc)
 
@@ -98,9 +97,6 @@ def create_app() -> Flask:
                 data = api.cmd_overview()
             elif command == "grouped":
                 data = api.cmd_grouped()
-            elif command == "portfolio":
-                rng = request.args.get("range", "1d")
-                data = api.cmd_portfolio(range_token=rng)
             elif command == "signals":
                 args = request.args
                 kwargs = {}
@@ -333,24 +329,13 @@ def create_app() -> Flask:
                     "WHERE status NOT IN ('filled','canceled','expired','rejected')"
                 ).fetchone()[0]
 
-                # Last 20 decisions (combined stock + options)
+                # Last 20 decisions
                 recent_stock = conn.execute(
                     "SELECT 'stock' kind, ticker, direction, model_p, "
                     "       outcome, decided_at "
                     "FROM bot_decisions ORDER BY id DESC LIMIT 20"
                 ).fetchall()
-                try:
-                    recent_opt = conn.execute(
-                        "SELECT 'option' kind, underlying ticker, direction, "
-                        "       model_p, outcome, decided_at "
-                        "FROM bot_option_decisions ORDER BY id DESC LIMIT 20"
-                    ).fetchall()
-                except Exception:  # noqa: BLE001
-                    recent_opt = []
-                recent = sorted(
-                    [dict(r) for r in list(recent_stock) + list(recent_opt)],
-                    key=lambda d: d.get("decided_at", ""), reverse=True,
-                )[:20]
+                recent = [dict(r) for r in recent_stock]
 
                 # 7-day rolling stats
                 week = conn.execute(

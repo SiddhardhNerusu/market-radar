@@ -33,6 +33,6 @@ python scripts/init_db.py
 echo ""
 echo "Setup complete."
 echo "Next steps:"
-echo "  1. Edit .env and fill in your API keys (T212, Anthropic, Reddit, Finnhub, etc.)"
+echo "  1. Edit .env and fill in your API keys (Alpaca, Anthropic, Finnhub, etc.)"
 echo "  2. Run the daemon manually:    python scripts/run_daemon.py"
 echo "  3. Install as launchd job:     bash scripts/install_launchd.sh"

@@ -104,7 +104,6 @@ class RiskManager:
         account_equity_usd: Optional[float] = None,
         current_gross_usd: Optional[float] = None,
         current_notional_usd: Optional[float] = None,
-        current_crypto_usd: Optional[float] = None,
         current_ticker_usd: Optional[float] = None,
         current_position_count: Optional[int] = None,
         market_open: bool = True,
@@ -231,56 +230,20 @@ class RiskManager:
         else:
             new_position_usd = account_equity_usd * (t.size_pct / 100.0)
         gross_after = gross_now + new_position_usd
-        # Options reserve — keep a chunk of total gross available ONLY for option
-        # spreads (the highest-EV path). Stocks and crypto compete for the
-        # remaining budget; options get the full gross cap.
-        if t.kind == "option":
-            effective_cap = CONFIG.risk_max_gross_exposure_usd
-        else:
-            effective_cap = (CONFIG.risk_max_gross_exposure_usd
-                             - CONFIG.risk_options_reserve_usd)
+        effective_cap = CONFIG.risk_max_gross_exposure_usd
         if gross_after > effective_cap + 1.0:  # $1 rounding slack
             return RiskDecision(
                 False,
                 f"Gross exposure ${gross_after:.0f} would exceed "
-                f"${effective_cap:.0f} ({'options' if t.kind == 'option' else 'non-option'} cap; "
-                f"options reserve=${CONFIG.risk_options_reserve_usd:.0f})",
+                f"${effective_cap:.0f} (gross cap)",
                 "max_gross_exposure",
             )
-
-        # Rule 6b: crypto-only ceiling. Crypto trades 24/7 and would fill the
-        # entire gross budget overnight before US-session stocks/options ever
-        # see a candidate. Hard cap forces crypto to be selective.
-        # WEEKEND: when the US market is closed, the stock+options budget is
-        # idle, so crypto is allowed a higher ceiling to put that capital to
-        # work. Reverts automatically the moment the market opens; the Monday
-        # pre-open trim brings exposure back to the weekday cap.
-        if t.kind == "crypto":
-            crypto_cap = (CONFIG.risk_max_crypto_exposure_usd if market_open
-                          else CONFIG.risk_max_crypto_exposure_weekend_usd)
-            if current_crypto_usd is not None:
-                crypto_now = float(current_crypto_usd)
-            else:
-                crypto_now = self._current_crypto_exposure_usd() or 0.0
-            crypto_after = crypto_now + new_position_usd
-            if crypto_after > crypto_cap + 1.0:  # $1 slack
-                return RiskDecision(
-                    False,
-                    f"Crypto exposure ${crypto_after:.0f} would exceed "
-                    f"${crypto_cap:.0f} (crypto-only cap, "
-                    f"{'market-open' if market_open else 'weekend'})",
-                    "max_crypto_exposure",
-                )
 
         # Rule 7a: per-ticker concentration — checks TOTAL exposure on this
         # ticker (existing + new), bound on TRUE equity. Prevents stacking
         # via multiple signals on the same name while still allowing a
         # single high-conviction Kelly-sized trade.
-        # Options get a higher cap (12%) because risk is DEFINED — max loss
-        # is the debit paid. Allows one max-conviction spread plus a small
-        # add-on, but stops the 5x-AAPL-spread runaway.
-        per_ticker_cap = (12.0 if t.kind == "option"
-                          else CONFIG.risk_max_position_pct)
+        per_ticker_cap = CONFIG.risk_max_position_pct
         if current_ticker_usd is not None:
             existing_ticker_usd = float(current_ticker_usd)
         else:
@@ -517,66 +480,21 @@ class RiskManager:
             log.warning("risk._latest_account_equity failed: %s", exc)
             return None
 
-    def _current_crypto_exposure_usd(self) -> Optional[float]:
-        """Sum of open Alpaca crypto positions' market value.
-
-        Reads from ``bot_orders`` (currently-open fills with no realized P&L
-        recorded yet) — same data path the live trader uses internally.
-        Returns 0.0 if no open crypto. Fails closed (None) on error.
-        """
+    def _current_ticker_exposure_usd(self, ticker: str, kind: str) -> float:
+        """Open exposure on this specific ticker: sum of |qty * filled_avg_price|
+        over open fills in bot_orders (equity lane only)."""
         try:
             with get_connection() as conn:
                 row = conn.execute(
                     """
-                    SELECT COALESCE(SUM(ABS(qty * filled_avg_price)), 0) AS gross
+                    SELECT COALESCE(SUM(ABS(qty * filled_avg_price)), 0) AS exposure
                     FROM bot_orders
                     WHERE status = 'filled'
                       AND realized_pnl_usd IS NULL
-                      AND (ticker LIKE '%/USD' OR (ticker LIKE '%USD' AND LENGTH(ticker) <= 9))
-                    """
+                      AND UPPER(ticker) = ?
+                    """,
+                    (ticker.upper(),),
                 ).fetchone()
-                return float(row[0]) if row else 0.0
-        except Exception as exc:  # noqa: BLE001
-            log.warning("risk._current_crypto_exposure_usd failed: %s", exc)
-            return None
-
-    def _current_ticker_exposure_usd(self, ticker: str, kind: str) -> float:
-        """Open exposure on this specific ticker (or underlying for options).
-
-        For stocks/crypto: sum of |qty * filled_avg_price| from bot_orders.
-        For options: sum of total_debit_usd from bot_option_spreads where
-        underlying matches and the spread is still open.
-        """
-        try:
-            with get_connection() as conn:
-                if kind == "option":
-                    row = conn.execute(
-                        """
-                        SELECT COALESCE(SUM(total_debit_usd), 0) AS exposure
-                        FROM bot_option_spreads
-                        WHERE underlying = ?
-                          AND closed_at IS NULL
-                        """,
-                        (ticker.upper(),),
-                    ).fetchone()
-                else:
-                    # Stocks/crypto — normalize ticker forms (BTC/USD vs BTCUSD)
-                    candidates = {ticker.upper()}
-                    if "/" in ticker:
-                        candidates.add(ticker.replace("/", "").upper())
-                    elif ticker.upper().endswith("USD") and len(ticker) <= 9:
-                        candidates.add(f"{ticker[:-3].upper()}/USD")
-                    placeholders = ",".join("?" * len(candidates))
-                    row = conn.execute(
-                        f"""
-                        SELECT COALESCE(SUM(ABS(qty * filled_avg_price)), 0) AS exposure
-                        FROM bot_orders
-                        WHERE status = 'filled'
-                          AND realized_pnl_usd IS NULL
-                          AND UPPER(ticker) IN ({placeholders})
-                        """,
-                        tuple(candidates),
-                    ).fetchone()
                 return float(row[0]) if row else 0.0
         except Exception as exc:  # noqa: BLE001
             log.warning("risk._current_ticker_exposure_usd failed: %s", exc)
@@ -591,29 +509,18 @@ class RiskManager:
         already held ~$5500 of equity exposure. Now reads from bot_orders
         (the Alpaca-mirror DB the live trader populates).
 
-        Counts: stock + crypto + option-spread DEBITS (option max-loss).
+        Counts open equity fills only (the options/crypto lanes were removed).
         """
         try:
             with get_connection() as conn:
-                # Stocks + crypto from bot_orders (open fills, no realized P&L yet)
-                stock_crypto = conn.execute(
+                row = conn.execute(
                     """
                     SELECT COALESCE(SUM(ABS(qty * filled_avg_price)), 0) AS gross
                     FROM bot_orders
                     WHERE status = 'filled' AND realized_pnl_usd IS NULL
                     """
                 ).fetchone()
-                stock_crypto_usd = float(stock_crypto[0]) if stock_crypto else 0.0
-                # Open option spreads — debit paid is the max-loss exposure
-                opts = conn.execute(
-                    """
-                    SELECT COALESCE(SUM(total_debit_usd), 0) AS gross
-                    FROM bot_option_spreads
-                    WHERE closed_at IS NULL
-                    """
-                ).fetchone()
-                opts_usd = float(opts[0]) if opts else 0.0
-                return stock_crypto_usd + opts_usd
+                return float(row[0]) if row else 0.0
         except Exception as exc:  # noqa: BLE001
             log.warning("risk._current_gross_exposure_usd failed: %s", exc)
             return None
@@ -624,7 +531,6 @@ class RiskManager:
         """Percent of account equity in the given sector.
 
         Sums open Alpaca positions (bot_orders) by sector via SECTOR_MAP.
-        Options spreads are counted by underlying.
         Fails closed (returns 100% on error so trade is blocked).
         """
         if not account_equity or account_equity <= 0:
@@ -641,25 +547,13 @@ class RiskManager:
                 total = 0.0
                 for r in rows:
                     t = (r["ticker"] or "").upper()
-                    base = t.split("/")[0] if "/" in t else t  # crypto BTC/USD → BTC
-                    if SECTOR_MAP.get(base, "other").lower() != sector.lower():
+                    if SECTOR_MAP.get(t, "other").lower() != sector.lower():
                         continue
                     qty = float(r["qty"] or 0)
                     px = r["filled_avg_price"]
                     if px is None:
                         continue
                     total += abs(qty * float(px))
-                # Add option spreads on tickers in this sector
-                opt_rows = conn.execute(
-                    """
-                    SELECT underlying, total_debit_usd
-                    FROM bot_option_spreads
-                    WHERE closed_at IS NULL
-                    """
-                ).fetchall()
-                for r in opt_rows:
-                    if SECTOR_MAP.get((r["underlying"] or "").upper(), "other").lower() == sector.lower():
-                        total += float(r["total_debit_usd"] or 0)
                 return total / account_equity * 100.0
         except Exception as exc:  # noqa: BLE001
             log.warning("risk._current_sector_exposure_pct failed: %s", exc)

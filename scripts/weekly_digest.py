@@ -70,7 +70,7 @@ def main() -> int:
             (week_start,),
         ).fetchall()
 
-        # Best + worst stock/crypto trades
+        # Best + worst stock trades
         top_orders = conn.execute(
             """
             SELECT ticker, ROUND(realized_pnl_usd, 2) AS pnl, exit_reason,
@@ -90,20 +90,6 @@ def main() -> int:
             WHERE realized_pnl_usd IS NOT NULL
               AND filled_at >= ?
             ORDER BY realized_pnl_usd ASC
-            LIMIT 3
-            """,
-            (week_start,),
-        ).fetchall()
-
-        # Option spreads of the week
-        top_spreads = conn.execute(
-            """
-            SELECT underlying, ROUND(realized_pnl_usd, 2) AS pnl,
-                   ROUND(total_debit_usd, 2) AS debit, exit_reason
-            FROM bot_option_spreads
-            WHERE realized_pnl_usd IS NOT NULL
-              AND closed_at >= ?
-            ORDER BY realized_pnl_usd DESC
             LIMIT 3
             """,
             (week_start,),
@@ -190,11 +176,8 @@ def main() -> int:
             )
         lines.append("")
 
-    if top_orders or top_spreads:
+    if top_orders:
         lines.append("<b>Top winners:</b>")
-        for s in top_spreads or []:
-            s = dict(s)
-            lines.append(f"  💰 {s['underlying']} options +${s['pnl']:.2f} ({s['exit_reason']})")
         for o in top_orders or []:
             o = dict(o)
             if (o["pnl"] or 0) > 0:

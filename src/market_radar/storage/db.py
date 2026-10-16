@@ -19,7 +19,7 @@ from ..config import CONFIG, PROJECT_ROOT
 SCHEMA_PATH = PROJECT_ROOT / "sql" / "schema.sql"
 LLM_SCHEMA_PATH = PROJECT_ROOT / "sql" / "llm_schema.sql"
 EXECUTION_SCHEMA_PATH = PROJECT_ROOT / "sql" / "execution_schema.sql"
-OPTIONS_SCHEMA_PATH = PROJECT_ROOT / "sql" / "options_schema.sql"
+LANE_SCHEMA_PATH = PROJECT_ROOT / "sql" / "lane_schema.sql"
 
 
 def utc_now() -> str:
@@ -92,9 +92,10 @@ def init_db(path: Optional[Path] = None) -> None:
         # Execution layer tables (bot orders + decisions + daily P&L)
         if EXECUTION_SCHEMA_PATH.exists():
             conn.executescript(EXECUTION_SCHEMA_PATH.read_text())
-        # Options layer tables (bot_option_decisions / _spreads / _legs)
-        if OPTIONS_SCHEMA_PATH.exists():
-            conn.executescript(OPTIONS_SCHEMA_PATH.read_text())
+        # Insider lane tables (lane_decisions / lane_positions / lane_state /
+        # edge_ledger) — the long-only Form 4 lane and its forward OOS record.
+        if LANE_SCHEMA_PATH.exists():
+            conn.executescript(LANE_SCHEMA_PATH.read_text())
         _migrate_columns(conn)
 
 

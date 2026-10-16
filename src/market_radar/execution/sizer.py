@@ -153,11 +153,10 @@ def size_trade(
     qty = notional / entry_price
 
     # Integer shares for stocks (bracket orders require whole shares).
-    # Fractional permitted for crypto path (no bracket on crypto anyway).
     if not allow_fractional:
         qty = max(0.0, float(int(qty)))
     else:
-        qty = max(0.0, round(qty, 6))  # 6 decimals = Alpaca crypto precision
+        qty = max(0.0, round(qty, 6))
     if qty < min_qty:
         return SizingResult(
             qty=0.0, size_pct=size_pct, notional_usd=notional,
@@ -213,24 +212,14 @@ _ATR_TTL = timedelta(hours=6)
 
 
 def get_atr(ticker: str, *, period: int = 14, lookback_days: int = 30) -> Optional[float]:
-    """Return ATR(``period``) for ``ticker`` in USD per share.
-
-    Routes to Alpaca's crypto bars endpoint when ``ticker`` contains '/'
-    (yfinance doesn't support pair-format crypto symbols). Stocks use yfinance.
-
-    Returns None if data can't be fetched. Cached for ``_ATR_TTL``.
-    """
+    """Return ATR(``period``) for ``ticker`` in USD per share, from yfinance
+    daily bars (no API key needed). Returns None if data can't be fetched.
+    Cached for ``_ATR_TTL``. Equities only — the crypto lane was removed."""
     now = datetime.utcnow()
     cached = _ATR_CACHE.get(ticker)
     if cached and (now - cached[0]) < _ATR_TTL:
         return cached[1]
-
-    is_crypto = "/" in ticker
-    if is_crypto:
-        atr_val = _crypto_atr(ticker, period=period, lookback_days=lookback_days)
-    else:
-        atr_val = _stock_atr_yfinance(ticker, period=period, lookback_days=lookback_days)
-
+    atr_val = _stock_atr_yfinance(ticker, period=period, lookback_days=lookback_days)
     if atr_val is None or atr_val <= 0:
         return None
     _ATR_CACHE[ticker] = (now, atr_val)
@@ -265,41 +254,8 @@ def _stock_atr_yfinance(ticker: str, *, period: int, lookback_days: int) -> Opti
     return _atr_from_ohlc(_to_list("High"), _to_list("Low"), _to_list("Close"), period)
 
 
-def _crypto_atr(pair: str, *, period: int, lookback_days: int) -> Optional[float]:
-    """Crypto ATR via Alpaca daily bars (yfinance doesn't have pair-format)."""
-    try:
-        from .alpaca_client import AlpacaClient, AlpacaError
-        c = AlpacaClient()
-    except Exception as exc:  # noqa: BLE001
-        log.debug("crypto ATR alpaca init failed: %s", exc)
-        return None
-    from datetime import datetime as _dt, timezone as _tz
-    end = _dt.now(_tz.utc)
-    start = end - timedelta(days=lookback_days + 5)
-    params = {
-        "symbols": pair, "timeframe": "1Day",
-        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "limit": 100,
-    }
-    try:
-        d = c._request("GET", "/v1beta3/crypto/us/bars",
-                       params=params, base=c.data_base_url)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("crypto ATR bars(%s) failed: %s", pair, exc)
-        return None
-    bars = (d or {}).get("bars", {}).get(pair) or []
-    if len(bars) < period + 1:
-        return None
-    highs = [b["h"] for b in bars]
-    lows = [b["l"] for b in bars]
-    closes = [b["c"] for b in bars]
-    return _atr_from_ohlc(highs, lows, closes, period)
-
-
 def _atr_from_ohlc(highs, lows, closes, period: int) -> Optional[float]:
-    """Pure-Python ATR computation. Works for stocks (pandas Series → tolist)
-    or crypto (Alpaca bars → list directly)."""
+    """Pure-Python ATR computation over parallel high/low/close lists."""
     if len(highs) < period + 1:
         return None
     trs = []

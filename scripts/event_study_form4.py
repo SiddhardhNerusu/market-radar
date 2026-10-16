@@ -109,19 +109,25 @@ class BarSource:
             return []
         if df is None or len(df) == 0:
             return []
-        if hasattr(df.columns, "levels") and df.columns.nlevels > 1:
-            try:
-                df = df.xs(symbol, axis=1, level=-1)
-            except KeyError:
-                df.columns = [c[0] for c in df.columns]
+        # yfinance returns MultiIndex columns (field, ticker) in recent versions,
+        # and occasionally duplicate flat names; flatten to one scalar per field.
+        if getattr(df.columns, "nlevels", 1) > 1:
+            df.columns = df.columns.get_level_values(0)
+        df = df.loc[:, ~df.columns.duplicated()]
+        if "Close" not in df.columns:
+            return []
+        close = df["Close"].astype(float)
+        get = lambda col: df[col].astype(float) if col in df.columns else close  # noqa: E731
+        o, h, l = get("Open"), get("High"), get("Low")
+        v = df["Volume"].astype(float) if "Volume" in df.columns else close * 0
         out = []
-        for idx, row in df.iterrows():
-            c = row.get("Close")
-            if c is None or (isinstance(c, float) and math.isnan(c)):
+        for i, idx in enumerate(df.index):
+            c = float(close.iloc[i])
+            if math.isnan(c):
                 continue
-            out.append({"t": idx.strftime("%Y-%m-%d"), "o": float(row.get("Open", c)),
-                        "h": float(row.get("High", c)), "l": float(row.get("Low", c)),
-                        "c": float(c), "v": float(row.get("Volume", 0) or 0)})
+            out.append({"t": idx.strftime("%Y-%m-%d"), "o": float(o.iloc[i]), "h": float(h.iloc[i]),
+                        "l": float(l.iloc[i]), "c": c,
+                        "v": 0.0 if math.isnan(float(v.iloc[i])) else float(v.iloc[i])})
         return out
 
     # -- minute --------------------------------------------------------------
